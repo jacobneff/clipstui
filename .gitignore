@@ -65,6 +65,7 @@ $RECYCLE.BIN/
 # Project-specific runtime outputs
 # ------------------------------
 # Downloaded clips / logs
+*.mp4
 clips/
 failed.txt
 *.part
@@ -87,4 +88,3 @@ thumbnails/
 # ------------------------------
 # Textual may write logs/screenshots depending on configuration
 textual.log
-*.mp4
