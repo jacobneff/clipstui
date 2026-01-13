@@ -1,0 +1,90 @@
+# ------------------------------
+# Python bytecode / caches
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+*.log
+
+# ------------------------------
+# Virtual environments
+# ------------------------------
+.venv/
+venv/
+ENV/
+env/
+
+# ------------------------------
+# Build / packaging artifacts
+# ------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# ------------------------------
+# UV
+# ------------------------------
+# Keep uv.lock committed (recommended), but ignore local uv state/caches.
+.uv/
+uv-cache/
+**/.uv/
+
+# ------------------------------
+# Editors / IDEs
+# ------------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ------------------------------
+# Windows
+# ------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ------------------------------
+# Project-specific runtime outputs
+# ------------------------------
+# Downloaded clips / logs
+clips/
+failed.txt
+*.part
+*.ytdl
+
+# Caches (metadata, thumbnails, indexes)
+.cache/
+cache/
+data/
+tmp/
+temp/
+
+# If you store thumbnail frames or extracted images locally:
+frames/
+thumbs/
+thumbnails/
+
+# ------------------------------
+# Textual
+# ------------------------------
+# Textual may write logs/screenshots depending on configuration
+textual.log
+*.mp4

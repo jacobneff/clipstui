@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clipstui"
+version = "0.1.0"
+description = "A Textual TUI for managing and downloading timestamped YouTube clips via yt-dlp."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Jacob" }]
+dependencies = [
+  "textual>=0.70.0",
+  "textual-image>=0.8.5",
+  "platformdirs>=4.2.0",
+  "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.6.0",
+  "mypy>=1.11.0",
+]
+
+[project.scripts]
+clipstui = "clipstui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clipstui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = ["src"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
