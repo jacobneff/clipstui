@@ -40,6 +40,18 @@ Optional output format:
 uv run clipstui path\to\clips.clip --output-format mp4
 ```
 
+Optional output template:
+
+```sh
+uv run clipstui path\to\clips.clip --output-template "{tag}_{start}-{end}_{videoid}_{title}"
+```
+
+Optional preset profile:
+
+```sh
+uv run clipstui path\to\clips.clip --preset "Volleyball highlights"
+```
+
 Preview thumbnails are captured at the clip start time (requires `yt-dlp` + `ffmpeg`).
 
 The MVP flow is:
@@ -50,14 +62,26 @@ The MVP flow is:
 4. Press `d` to download the selected clip (output defaults to the clip file directory).
 5. Use the queue list to monitor progress and retry failures.
 
+Export helpers:
+
+- Manifests: `*_clips.csv` + `*_clips.json` in the output directory.
+- Concat list: `*_concat.txt` in the output directory for ffmpeg (absolute paths).
+- Rally pack: `*_rally_pack` folder with copied outputs plus `concat.txt` and `missing.txt`.
+
 Keybinds:
 
 - `q`: quit (global)
 - `r`: reload the current file
+- `ctrl+p`: command palette
 - `d`: download selected clip
 - `A`: download all clips
 - `f`: retry failed downloads
 - `F`: retry failed downloads for current video
+- `O`: open output in player (mpv/vlc)
+- `Y`: open YouTube at clip start
+- `E`: export manifest (CSV/JSON)
+- `C`: export ffmpeg concat list
+- `B`: create rally pack folder (copy + concat list)
 - `t`: toggle auto-tag prefix by video
 - `P`: set global pad defaults
 - `V`: set pad for current video
@@ -77,6 +101,8 @@ Keybinds:
 - `v`: toggle vim mode for the file picker
 - `o`: set output directory
 - `m`: set output format (mp4/mkv/webm)
+- `T`: set output template
+- `L`: load preset profile
 - `/`: fuzzy search files/folders in the current tree root (Telescope-style)
 - `?`: show help
 

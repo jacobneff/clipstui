@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import queue
 import shutil
+import stat
 import subprocess
 import threading
+import time
+import webbrowser
+from dataclasses import dataclass
 from string import ascii_uppercase
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.theme import Theme
 from textual.widgets import (
-    Button,
     Input,
     Label,
     ListItem,
@@ -58,19 +66,36 @@ from .fileops_plan import (
 )
 from .metadata import VideoMetadata, get_metadata
 from .parser import ClipSpec, format_clip_file, parse_clip_file
-from .resolve import ResolvedClip, resolve_clip
+from .presets import PresetProfile, find_preset, list_presets
+from .resolve import (
+    DEFAULT_OUTPUT_TEMPLATE,
+    ResolvedClip,
+    format_output_basename,
+    resolve_clip,
+    validate_output_template,
+)
+from .exports import (
+    build_concat_list,
+    build_manifest_entries,
+    manifest_to_csv,
+    manifest_to_json,
+)
 from .timeparse import format_seconds
-from .thumbs import generate_clip_thumbnail
+from .thumbs import download_thumbnail, generate_clip_thumbnail
 from .ui.edit_buffer import PlanPreviewScreen
 from .ui.file_browser import FileEntryKind, file_icon_for_kind, is_hidden, path_sort_key
 from .ui.file_buffer import FileBufferTextArea, strip_icon_prefix
 from .ui.screens import (
+    CommandAction,
+    CommandPaletteScreen,
     CreateEntryScreen,
     DeleteEntryScreen,
     HelpScreen,
     MoveEntryScreen,
     OutputDirScreen,
     OutputFormatScreen,
+    OutputTemplateScreen,
+    PresetScreen,
     RenameEntryScreen,
     SearchResult,
     SearchScreen,
@@ -90,9 +115,17 @@ TIP_TEXT = "Tip: press ? for help (and / to search)"
 HELP_TEXT = """Keyboard shortcuts
 q  quit (global)
 r  reload clip file
+ctrl+p  command palette
 h  toggle hidden files (when picker not focused)
 m  set output format
+T  set output template
 o  set output directory
+L  load preset profile
+O  open output in player
+Y  open YouTube at clip start
+E  export manifest (csv/json)
+C  export concat list (ffmpeg)
+B  create rally pack folder
 f  retry failed downloads
 F  retry failed for current video
 t  toggle auto-tag prefix
@@ -134,11 +167,10 @@ Clip list
 d/enter  download current clip (or selected clips)
 space  toggle clip selection
 p  paste clip from clipboard
-D  download only failed (selected clips)
+K/B/A/D/S/E  label selected clips (kill/block/ace/dig/set/error)
 enter/space on group header  expand/collapse group
 e  edit clip
 a  add clip
-A  download all clips
 
 Clip editor
 [ / ]  nudge active time by 0.1s
@@ -150,6 +182,48 @@ p  pause/resume selected
 x  cancel selected
 ctrl+up/down  move queue item
 """
+
+LABEL_KEY_MAP = {
+    "K": "K",
+    "B": "B",
+    "A": "A",
+    "D": "D",
+    "S": "S",
+    "E": "E",
+}
+
+TOKYO_NIGHT_THEME = Theme(
+    name="tokyo-night",
+    primary="#7aa2f7",
+    secondary="#7dcfff",
+    accent="#bb9af7",
+    warning="#e0af68",
+    error="#f7768e",
+    success="#9ece6a",
+    foreground="#c0caf5",
+    background="#1a1b26",
+    surface="#1f2335",
+    panel="#24283b",
+    boost="#2f334d",
+    variables={
+        "block-cursor-background": "#7aa2f7",
+        "block-cursor-foreground": "#1a1b26",
+        "footer-key-foreground": "#7aa2f7",
+        "input-selection-background": "#7aa2f7 30%",
+        "button-color-foreground": "#1a1b26",
+        "button-focus-text-style": "bold",
+    },
+)
+
+
+@dataclass(frozen=True)
+class _ClipLoadResult:
+    resolved: list[ResolvedClip]
+    groups: list[ClipGroup]
+    overlap_index: dict[ResolvedClip, list[OverlapFinding]]
+    merge_suggestions: list[MergeSuggestion]
+    merge_index: dict[ResolvedClip, list[MergeSuggestion]]
+    select_index: int | None
 
 
 class FileBufferMode(Enum):
@@ -171,7 +245,7 @@ class ClipListItem(ListItem):
         self._selected = selected
         self._warning = warning
         self._label = Label(_format_list_label(resolved, selected, warning))
-        super().__init__(self._label)
+        super().__init__(self._label, classes="clip-item")
 
     def set_selected(self, selected: bool) -> None:
         if self._selected == selected:
@@ -192,7 +266,7 @@ class ClipGroupItem(ListItem):
         self._collapsed = collapsed
         self._title = title
         self._label = Label(_format_group_label(group, collapsed, title))
-        super().__init__(self._label)
+        super().__init__(self._label, classes="clip-group")
 
     @property
     def video_id(self) -> str:
@@ -215,6 +289,15 @@ class ClipGroupItem(ListItem):
 
 
 class QueueListItem(ListItem):
+    _STATUS_CLASSES = {
+        DownloadStatus.QUEUED: "status-queued",
+        DownloadStatus.DOWNLOADING: "status-downloading",
+        DownloadStatus.PAUSED: "status-paused",
+        DownloadStatus.DONE: "status-done",
+        DownloadStatus.FAILED: "status-failed",
+        DownloadStatus.CANCELED: "status-canceled",
+    }
+
     def __init__(self, item: QueueItem, selected: bool = False) -> None:
         self.item = item
         self._selected = selected
@@ -225,11 +308,9 @@ class QueueListItem(ListItem):
             show_eta=False,
             classes="queue_item_bar",
         )
+        self._sync_status_classes()
         percent = _progress_value(item)
-        if percent is None:
-            self._bar.update(total=None)
-        else:
-            self._bar.update(progress=percent)
+        self._bar.update(total=100, progress=percent)
         super().__init__(Horizontal(self._label, self._bar), classes="queue_item")
 
     def set_selected(self, selected: bool) -> None:
@@ -238,19 +319,24 @@ class QueueListItem(ListItem):
         self._selected = selected
         self.refresh_label()
 
+    def _sync_status_classes(self) -> None:
+        status_class = self._STATUS_CLASSES.get(self.item.status, "status-queued")
+        for class_name in self._STATUS_CLASSES.values():
+            self._bar.remove_class(class_name)
+        self._bar.add_class(status_class)
+
     def refresh_label(self) -> None:
         self._label.update(_format_queue_label(self.item, self._selected))
+        self._sync_status_classes()
         percent = _progress_value(self.item)
-        if percent is None:
-            self._bar.update(total=None)
-        else:
-            self._bar.update(total=100, progress=percent)
+        self._bar.update(total=100, progress=percent)
 
 
 class ClipstuiApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "reload", "Reload"),
+        ("ctrl+p", "command_palette", "Command Palette"),
         ("c", "create_entry", "Create"),
         ("R", "rename_entry", "Rename"),
         ("M", "move_entry", "Move"),
@@ -258,6 +344,13 @@ class ClipstuiApp(App):
         ("h", "toggle_hidden", "Hidden"),
         ("o", "output_dir", "Output Dir"),
         ("m", "output_format", "Output Format"),
+        ("T", "output_template", "Output Template"),
+        ("L", "preset", "Preset"),
+        ("O", "open_in_player", "Open in Player"),
+        ("Y", "open_youtube", "Open YouTube"),
+        ("E", "export_manifest", "Export Manifest"),
+        ("C", "export_concat", "Export Concat"),
+        ("B", "rally_pack", "Rally Pack"),
         ("f", "retry_failed", "Retry Failed"),
         ("F", "retry_failed_video", "Retry Failed (Video)"),
         ("t", "toggle_tag_prefix", "Tag Prefix"),
@@ -271,29 +364,39 @@ class ClipstuiApp(App):
     ]
 
     CSS = """
+    Screen {
+        background: $background;
+        color: $text;
+    }
+
     #root {
         height: 100%;
     }
 
     #main {
         height: 1fr;
+        padding: 1 1;
     }
 
     #left, #middle, #right {
-        border: heavy $accent;
         padding: 1 1;
+        background: $surface;
     }
 
     #left {
         width: 30%;
+        border: round $secondary;
     }
 
     #middle {
         width: 35%;
+        border: round $primary;
+        background: $panel;
     }
 
     #right {
         width: 35%;
+        border: round $accent;
     }
 
     #file_buffer, #clip_list {
@@ -302,79 +405,109 @@ class ClipstuiApp(App):
 
     #file_buffer {
         border: none;
+        background: $surface;
+        color: $text;
     }
 
     #file_buffer.mode-normal .text-area--cursor {
-        background: #ffffff;
-        color: #000000;
+        background: $primary;
+        color: $background;
     }
 
     #file_buffer.mode-insert .text-area--cursor {
         background: transparent;
-        color: #ffffff;
+        color: $primary;
     }
 
     #file_command {
         height: 1;
         width: 100%;
-        border: none;
-        background: #0b0d12;
-        color: #f8f8f2;
+        border: round $boost;
+        background: $panel;
+        color: $text;
         padding: 0 1;
     }
 
     #file_command .input--text,
     #file_command .input--content {
-        color: #f8f8f2;
+        color: $text;
     }
 
     #file_command .input--cursor {
-        background: #f8f8f2;
-        color: #0b0d12;
+        background: $primary;
+        color: $background;
     }
 
     #file_command .input--placeholder {
-        color: #6c7086;
+        color: $text-muted;
     }
 
     #file_buffer .text-area--cursor-line {
-        background: $panel;
-    }
-
-    #download_all_button {
-        height: 1;
-        width: 100%;
-        min-width: 100%;
-        margin: 0 0 1 0;
-        padding: 0 1;
-        border: none;
-        background: $panel;
-        color: $text;
-        content-align: left middle;
-        text-align: left;
-    }
-
-    #download_all_button:hover,
-    #download_all_button:focus {
         background: $boost;
+    }
+
+    ListView {
+        background: transparent;
+    }
+
+    ListView > .list-item {
+        padding: 0 1;
+    }
+
+    ListView > .list-item.-hovered {
+        background: #2a2f43;
         color: $text;
     }
+
+    ListView > .list-item.-highlight {
+        background: #3b4261;
+        color: #e6e9ff;
+        text-style: bold;
+    }
+
+    ListView > .list-item.-highlight.-hovered {
+        background: #4b5173;
+        color: #f0f2ff;
+    }
+
+    ListView > .list-item.-highlight Label {
+        color: #e6e9ff;
+    }
+
+    ListView > .clip-group {
+        color: #c0caf5;
+    }
+
+    ListView > .clip-group.-highlight {
+        background: #3b4261;
+        color: #f0f2ff;
+    }
+
+    ListView > .clip-group.-highlight Label {
+        color: #f0f2ff;
+    }
+
 
     #thumb_image {
         height: 12;
-        width: 100%;
+        width: auto;
+        border: round $secondary;
     }
 
     #thumb_fallback {
         height: 12;
         width: 100%;
-        border: round $accent;
+        border: round $secondary;
+        background: $panel;
         padding: 0 1;
         overflow: hidden;
     }
 
     #preview_text {
         height: 1fr;
+        padding: 1 1;
+        background: $surface;
+        border: round $boost;
         overflow-y: auto;
     }
 
@@ -384,6 +517,16 @@ class ClipstuiApp(App):
 
     #file_status, #clips_label, #queue_label {
         height: 1;
+        text-style: bold;
+    }
+
+    #file_status {
+        color: $text-muted;
+        text-style: none;
+    }
+
+    #clips_label, #queue_label {
+        color: $primary;
     }
 
     #vim_status {
@@ -406,12 +549,54 @@ class ClipstuiApp(App):
         padding: 0 1;
     }
 
+    ProgressBar {
+        background: $panel;
+        color: $primary;
+    }
+
+    ProgressBar.status-queued > Bar > .bar--bar,
+    ProgressBar.status-queued > Bar > .bar--complete {
+        color: #3b4261;
+        background: #3b4261;
+    }
+
+    ProgressBar.status-downloading > Bar > .bar--bar,
+    ProgressBar.status-downloading > Bar > .bar--complete {
+        color: $secondary;
+        background: $secondary;
+    }
+
+    ProgressBar.status-done > Bar > .bar--bar,
+    ProgressBar.status-done > Bar > .bar--complete {
+        color: $success;
+        background: $success;
+    }
+
+    ProgressBar.status-paused > Bar > .bar--bar,
+    ProgressBar.status-paused > Bar > .bar--complete {
+        color: $warning;
+        background: $warning;
+    }
+
+    ProgressBar.status-failed > Bar > .bar--bar,
+    ProgressBar.status-failed > Bar > .bar--complete {
+        color: $error;
+        background: $error;
+    }
+
+    ProgressBar.status-canceled > Bar > .bar--bar,
+    ProgressBar.status-canceled > Bar > .bar--complete {
+        color: #565f89;
+        background: #565f89;
+    }
+
     #tip_bar {
         height: 1;
         padding: 0 1;
         content-align: left middle;
         color: $text-muted;
         background: $panel;
+        text-style: italic;
     }
 
     .hidden {
@@ -424,20 +609,35 @@ class ClipstuiApp(App):
         clip_path: Path | None = None,
         output_dir: Path | None = None,
         output_format: str | None = None,
+        output_template: str | None = None,
+        preset: PresetProfile | None = None,
     ) -> None:
         super().__init__()
+        self.register_theme(TOKYO_NIGHT_THEME)
+        self.theme = TOKYO_NIGHT_THEME.name
         self.clip_path = clip_path
-        self.output_dir = output_dir
-        self.output_format = _normalize_output_format(output_format or "mp4")
-        self._output_format_override = output_format is not None
-        self._output_dir_override = output_dir is not None
+        self.output_dir = None
+        self.output_format = _normalize_output_format("mp4")
+        self.output_template = DEFAULT_OUTPUT_TEMPLATE
+        self._output_format_override = False
+        self._output_dir_override = False
+        self._output_template_override = False
         self._tree_root = self._resolve_tree_root(clip_path)
         self._clips: list[ResolvedClip] = []
         self._clip_groups: list[ClipGroup] = []
         self._queue_items: list[QueueItem] = []
         self._queue_widgets: dict[int, QueueListItem] = {}
         self._queue_selection: set[int] = set()
+        self._queue_ui_state: dict[
+            int, tuple[float, float | None, float | None, int | None, DownloadStatus]
+        ] = {}
+        self._queue_preview_last = 0.0
+        self._download_queue: queue.Queue[QueueItem] | None = None
+        self._download_pending: set[int] = set()
+        self._download_workers_started = False
+        self._max_parallel_downloads = 2
         self._selected: ResolvedClip | None = None
+        self._selected_group_video_id: str | None = None
         self._clip_list_index = 0
         self._queue_list_index = 0
         self._clip_selection: set[ResolvedClip] = set()
@@ -481,8 +681,34 @@ class ClipstuiApp(App):
         self._thumb_errors: dict[tuple[str, str], str] = {}
         self._thumb_loading: set[tuple[str, str]] = set()
         self._thumb_fallback_cache: dict[tuple[str, str], Text] = {}
-        self._chafa_path = shutil.which("chafa")
+        self._video_thumb_cache: dict[str, Path] = {}
+        self._video_thumb_errors: dict[str, str] = {}
+        self._video_thumb_loading: set[str] = set()
+        self._video_thumb_queue: queue.Queue[tuple[str, str]] | None = None
+        self._video_thumb_worker_started = False
+        self._thumb_queue: queue.Queue[tuple[tuple[str, str], str, str, float]] | None = None
+        self._thumb_worker_started = False
+        self._metadata_queue: queue.Queue[tuple[str, str]] | None = None
+        self._metadata_worker_started = False
+        self._chafa_path: str | None = None
+        self._player_command: str | None = None
         self._show_hidden = False
+        self._clip_load_generation = 0
+        if preset is not None:
+            self._apply_preset_profile(preset, show_message=False)
+        if output_dir is not None:
+            self.output_dir = output_dir
+            self._output_dir_override = True
+        if output_format is not None:
+            normalized = _normalize_output_format(output_format)
+            if not _is_valid_output_format(normalized):
+                raise ValueError(f"Invalid output format: {output_format}")
+            self.output_format = normalized
+            self._output_format_override = True
+        if output_template is not None:
+            validate_output_template(output_template)
+            self.output_template = output_template
+            self._output_template_override = True
 
     def compose(self) -> ComposeResult:
         with Vertical(id="root"):
@@ -505,7 +731,6 @@ class ClipstuiApp(App):
                     )
                 with Vertical(id="middle"):
                     yield Label("Clips", id="clips_label")
-                    yield Button("Download All", id="download_all_button")
                     yield ListView(id="clip_list")
                     yield Label("Queue", id="queue_label")
                     yield ListView(id="queue_list")
@@ -530,10 +755,10 @@ class ClipstuiApp(App):
             self._file_buffer.set_root(self._tree_root)
             self._file_buffer.highlight_cursor_line = False
         self._set_file_mode(FileBufferMode.NORMAL)
-        self._populate_file_buffer()
-        self.set_interval(1.0, self._refresh_file_buffer_if_needed)
+        self.call_later(self._populate_file_buffer)
+        self.set_interval(2.0, self._refresh_file_buffer_if_needed)
         if self.clip_path and self.clip_path.is_file():
-            self.load_clip_file(self.clip_path)
+            self.call_later(self._load_clip_on_startup)
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen(HELP_TEXT))
@@ -547,6 +772,203 @@ class ClipstuiApp(App):
             OutputFormatScreen(self.output_format),
             self._handle_output_format,
         )
+
+    def action_output_template(self) -> None:
+        clip = self._selected or (self._clips[0] if self._clips else None)
+        title = None
+        if clip is not None:
+            metadata = self._metadata_cache.get(clip.video_id)
+            title = metadata.title if metadata and metadata.title else None
+        self.push_screen(
+            OutputTemplateScreen(self.output_template, clip, title),
+            self._handle_output_template,
+        )
+
+    def action_command_palette(self) -> None:
+        actions = self._command_palette_entries()
+        if not actions:
+            self._set_preview_message("No commands available.")
+            return
+        commands = [action for action, _ in actions]
+        handlers = {action.action_id: handler for action, handler in actions}
+        self.push_screen(
+            CommandPaletteScreen(commands),
+            lambda result: self._handle_command_palette(result, handlers),
+        )
+
+    def action_preset(self) -> None:
+        presets = list_presets()
+        if not presets:
+            self._set_preview_message("No preset profiles available.")
+            return
+        self.push_screen(PresetScreen(presets), self._handle_preset)
+
+    def action_open_in_player(self) -> None:
+        target = self._resolve_action_target()
+        if target is None:
+            self._set_preview_message("No clip selected.")
+            return
+        clip, queue_item = target
+        output_path = self._resolve_output_path(clip, queue_item)
+        if output_path is None:
+            return
+        if not output_path.exists():
+            self._set_preview_message(f"Output not found:\n{output_path}")
+            return
+        player = self._ensure_player_command()
+        if not player:
+            self._set_preview_message("Missing command: mpv or vlc")
+            return
+        try:
+            subprocess.Popen([player, str(output_path)])
+        except OSError as exc:
+            self._set_preview_message(f"Failed to open player:\n{exc}")
+            return
+        self._set_preview_message(f"Opened in player:\n{output_path}")
+
+    def action_open_youtube(self) -> None:
+        target = self._resolve_action_target()
+        if target is None:
+            self._set_preview_message("No clip selected.")
+            return
+        clip, _ = target
+        url = clip.clip.start_url
+        if not url:
+            self._set_preview_message("Clip has no start URL.")
+            return
+        opened = webbrowser.open(url)
+        if not opened:
+            self._set_preview_message("Failed to open browser.")
+
+    def action_export_manifest(self) -> None:
+        clips, scope = self._export_target_clips()
+        if not clips:
+            return
+        output_dir = self._output_dir()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_preview_message(f"Failed to create output dir:\n{exc}")
+            return
+        entries = build_manifest_entries(
+            clips,
+            output_dir=output_dir,
+            output_format=self.output_format,
+            output_template=self.output_template,
+            metadata=self._metadata_cache,
+        )
+        base_name = self._default_export_basename("clips")
+        base_name = self._unique_manifest_basename(output_dir, base_name)
+        csv_path = output_dir / f"{base_name}.csv"
+        json_path = output_dir / f"{base_name}.json"
+        try:
+            csv_path.write_text(manifest_to_csv(entries), encoding="utf-8")
+            json_path.write_text(
+                manifest_to_json(
+                    entries,
+                    output_dir=output_dir,
+                    output_format=self.output_format,
+                    output_template=self.output_template,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self._set_preview_message(f"Failed to write manifest:\n{exc}")
+            return
+        self._set_preview_message(
+            f"Exported {len(entries)} clips ({scope}) to:\n{csv_path}\n{json_path}"
+        )
+
+    def action_export_concat(self) -> None:
+        clips, scope = self._export_target_clips()
+        if not clips:
+            return
+        output_dir = self._output_dir()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_preview_message(f"Failed to create output dir:\n{exc}")
+            return
+        entries = build_manifest_entries(
+            clips,
+            output_dir=output_dir,
+            output_format=self.output_format,
+            output_template=self.output_template,
+            metadata=self._metadata_cache,
+        )
+        concat_paths = [entry.output_path.resolve() for entry in entries]
+        base_name = self._default_export_basename("concat")
+        concat_path = self._unique_export_path(
+            output_dir / f"{base_name}.txt", is_dir=False
+        )
+        try:
+            concat_path.write_text(build_concat_list(concat_paths), encoding="utf-8")
+        except OSError as exc:
+            self._set_preview_message(f"Failed to write concat list:\n{exc}")
+            return
+        self._set_preview_message(
+            f"Exported concat list ({scope}):\n{concat_path}\nRun ffmpeg from:\n{output_dir}"
+        )
+
+    def action_rally_pack(self) -> None:
+        clips, scope = self._export_target_clips()
+        if not clips:
+            return
+        output_dir = self._output_dir()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_preview_message(f"Failed to create output dir:\n{exc}")
+            return
+        entries = build_manifest_entries(
+            clips,
+            output_dir=output_dir,
+            output_format=self.output_format,
+            output_template=self.output_template,
+            metadata=self._metadata_cache,
+        )
+        pack_name = self._default_export_basename("rally_pack")
+        pack_dir = self._unique_export_path(output_dir / pack_name, is_dir=True)
+        try:
+            pack_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_preview_message(f"Failed to create rally pack:\n{exc}")
+            return
+        copied: list[Path] = []
+        missing: list[Path] = []
+        warnings: list[str] = []
+        for entry in entries:
+            source = entry.output_path
+            if not source.exists():
+                missing.append(source)
+                continue
+            target = self._unique_child_path(pack_dir, source.name)
+            try:
+                shutil.copy2(source, target)
+            except OSError:
+                missing.append(source)
+                continue
+            copied.append(target)
+        if copied:
+            concat_text = build_concat_list([Path(path.name) for path in copied])
+            try:
+                (pack_dir / "concat.txt").write_text(concat_text, encoding="utf-8")
+            except OSError as exc:
+                warnings.append(f"Concat list failed: {exc}")
+        if missing:
+            missing_text = "\n".join(str(path) for path in missing) + "\n"
+            try:
+                (pack_dir / "missing.txt").write_text(missing_text, encoding="utf-8")
+            except OSError as exc:
+                warnings.append(f"Missing list failed: {exc}")
+        message = (
+            f"Rally pack ({scope}):\n{pack_dir}\nCopied {len(copied)} clip(s)"
+        )
+        if missing:
+            message += f"\nMissing {len(missing)} clip(s)"
+        if warnings:
+            message += "\n" + "\n".join(warnings)
+        self._set_preview_message(message)
 
     def action_tree_root(self) -> None:
         self.push_screen(TreeRootScreen(self._tree_root), self._handle_tree_root)
@@ -882,6 +1304,41 @@ class ClipstuiApp(App):
         _apply_pad_updates(specs, indices, pad_before, pad_after)
         self._write_clip_specs(specs, select_index=min(indices))
 
+    def _apply_label_to_selection(self, label: str) -> None:
+        specs = self._load_clip_specs()
+        if specs is None:
+            return
+        if self._clip_selection:
+            indices = [
+                index
+                for index, clip in enumerate(self._clips)
+                if clip in self._clip_selection
+            ]
+        else:
+            current = self._current_clip_list_item()
+            if current is None:
+                self._set_preview_message("No clip selected.")
+                return
+            indices = [self._clips.index(current.resolved)]
+        if not indices:
+            self._set_preview_message("No clip selected.")
+            return
+        for index in indices:
+            spec = specs[index]
+            specs[index] = ClipSpec(
+                start_url=spec.start_url,
+                end_url=spec.end_url,
+                tag=spec.tag,
+                label=label,
+                rotation=spec.rotation,
+                score=spec.score,
+                opponent=spec.opponent,
+                serve_target=spec.serve_target,
+                pad_before=spec.pad_before,
+                pad_after=spec.pad_after,
+            )
+        self._write_clip_specs(specs, select_index=min(indices))
+
     def _append_clip_from_urls(self, start_url: str, end_url: str) -> None:
         specs = self._load_clip_specs()
         if specs is None:
@@ -945,6 +1402,11 @@ class ClipstuiApp(App):
                         start_url=first.start_url,
                         end_url=second.end_url,
                         tag=first.tag or second.tag,
+                        label=first.label or second.label,
+                        rotation=first.rotation or second.rotation,
+                        score=first.score or second.score,
+                        opponent=first.opponent or second.opponent,
+                        serve_target=first.serve_target or second.serve_target,
                         pad_before=first.pad_before,
                         pad_after=second.pad_after,
                     )
@@ -978,6 +1440,7 @@ class ClipstuiApp(App):
         self._merge_index = {}
         self._clip_selection.clear()
         self._selected = None
+        self._selected_group_video_id = None
 
     def _write_clip_specs(self, specs: list[ClipSpec], *, select_index: int | None) -> None:
         if self.clip_path is None:
@@ -999,10 +1462,7 @@ class ClipstuiApp(App):
                 self._clip_list_index = 0
             self._schedule_preview(event.item.resolved)
         elif isinstance(event.item, ClipGroupItem):
-            self._selected = None
-            self._show_thumbnail_message("Thumbnail: --")
-            title = _group_title(self._metadata_cache.get(event.item.video_id))
-            self._set_preview_message(_format_group_preview(event.item.group, title))
+            self._set_group_preview(event.item.group)
         elif isinstance(event.item, QueueListItem):
             try:
                 self._queue_list_index = self._queue_list_items().index(event.item)
@@ -1032,16 +1492,18 @@ class ClipstuiApp(App):
                 if event.key in {"escape", "ctrl+c"}:
                     self._file_pending = ""
                     return
-                if event.character == ":" or event.key in {"colon", ":"}:
+                key = event.character or event.key
+                if key == ":" or event.key in {"colon", ":"}:
                     self._enter_command_mode()
                     event.stop()
                     return
-                if self._handle_file_normal_key(event.key):
+                if self._handle_file_normal_key(key):
                     event.stop()
                     return
                 blocked_keys = {
                     "q",
                     "r",
+                    "ctrl+p",
                     "d",
                     "A",
                     "f",
@@ -1052,6 +1514,13 @@ class ClipstuiApp(App):
                     "S",
                     "N",
                     "g",
+                    "L",
+                    "O",
+                    "T",
+                    "Y",
+                    "E",
+                    "C",
+                    "B",
                     "c",
                     "R",
                     "M",
@@ -1062,7 +1531,7 @@ class ClipstuiApp(App):
                     "/",
                     "?",
                 }
-                if event.key in blocked_keys:
+                if key in blocked_keys:
                     event.stop()
                 return
             if self._file_mode in {FileBufferMode.VISUAL, FileBufferMode.VISUAL_LINE}:
@@ -1070,16 +1539,18 @@ class ClipstuiApp(App):
                     self._exit_visual_mode()
                     event.stop()
                     return
-                if event.character == ":" or event.key in {"colon", ":"}:
+                key = event.character or event.key
+                if key == ":" or event.key in {"colon", ":"}:
                     self._enter_command_mode()
                     event.stop()
                     return
-                if self._handle_file_visual_key(event.key):
+                if self._handle_file_visual_key(key):
                     event.stop()
                     return
                 blocked_keys = {
                     "q",
                     "r",
+                    "ctrl+p",
                     "d",
                     "A",
                     "f",
@@ -1090,6 +1561,13 @@ class ClipstuiApp(App):
                     "S",
                     "N",
                     "g",
+                    "L",
+                    "O",
+                    "T",
+                    "Y",
+                    "E",
+                    "C",
+                    "B",
                     "c",
                     "R",
                     "M",
@@ -1100,7 +1578,7 @@ class ClipstuiApp(App):
                     "/",
                     "?",
                 }
-                if event.key in blocked_keys:
+                if key in blocked_keys:
                     event.stop()
                 return
             if self._file_mode == FileBufferMode.INSERT:
@@ -1110,6 +1588,11 @@ class ClipstuiApp(App):
                 return
         if self._clip_list is not None and self._clip_list.has_focus:
             current_item = self._current_clip_list_widget()
+            label = LABEL_KEY_MAP.get(event.key)
+            if label is not None:
+                self._apply_label_to_selection(label)
+                event.stop()
+                return
             if event.key in {"enter", "return"}:
                 if isinstance(current_item, ClipGroupItem):
                     self._toggle_clip_group(current_item.video_id)
@@ -1119,10 +1602,6 @@ class ClipstuiApp(App):
                 return
             if event.key == "d":
                 self._download_selected_clips()
-                event.stop()
-                return
-            if event.key == "A":
-                self.action_download_all()
                 event.stop()
                 return
             if event.key in {"space", " "}:
@@ -1144,10 +1623,6 @@ class ClipstuiApp(App):
                 return
             if event.key == "p":
                 self.action_clipboard_ingest()
-                event.stop()
-                return
-            if event.key == "D":
-                self.action_download_failed()
                 event.stop()
                 return
         if self._queue_list is not None and self._queue_list.has_focus:
@@ -1202,65 +1677,111 @@ class ClipstuiApp(App):
         list_view = self._clip_list
         if list_view is None:
             return
+        self._clip_load_generation += 1
+        generation = self._clip_load_generation
+        self._clear_clip_state()
+        self._clip_list_index = 0
+        list_view.clear()
+        list_view.append(ListItem(Label("Loading clips...")))
+        list_view.index = 0
+        self._set_preview_message("Loading clips...")
+        self._show_thumbnail_message("Thumbnail: loading...")
+        self._pending_preview = None
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
 
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            list_view.clear()
-            self._set_preview_message(f"Failed to read file:\n{exc}")
-            self._show_thumbnail_message("Thumbnail: --")
-            self._clear_clip_state()
-            return
+        def worker() -> None:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                self.call_from_thread(
+                    self._apply_clip_load_error,
+                    generation,
+                    f"Failed to read file:\n{exc}",
+                )
+                return
 
-        try:
-            specs = parse_clip_file(text)
-        except ValueError as exc:
-            list_view.clear()
-            self._set_preview_message(f"Parse error:\n{exc}")
-            self._show_thumbnail_message("Thumbnail: --")
-            self._clear_clip_state()
-            return
+            try:
+                specs = parse_clip_file(text)
+            except ValueError as exc:
+                self.call_from_thread(
+                    self._apply_clip_load_error,
+                    generation,
+                    f"Parse error:\n{exc}",
+                )
+                return
 
-        try:
-            resolved = resolve_clips(
-                specs,
-                self._pad_before_default,
-                self._pad_after_default,
-                auto_tag=AutoTagOptions(prefix_by_video=self._auto_tag_prefix_video),
+            try:
+                resolved = resolve_clips(
+                    specs,
+                    self._pad_before_default,
+                    self._pad_after_default,
+                    auto_tag=AutoTagOptions(prefix_by_video=self._auto_tag_prefix_video),
+                )
+            except ValueError as exc:
+                self.call_from_thread(
+                    self._apply_clip_load_error,
+                    generation,
+                    f"Resolve error:\n{exc}",
+                )
+                return
+
+            groups = group_clips_by_video(resolved)
+            overlap_index = _index_overlaps(
+                analyze_overlaps(resolved, heavy_overlap_ratio=DEFAULT_OVERLAP_RATIO)
             )
-        except ValueError as exc:
-            list_view.clear()
-            self._set_preview_message(f"Resolve error:\n{exc}")
-            self._show_thumbnail_message("Thumbnail: --")
-            self._clear_clip_state()
-            return
+            merge_suggestions = plan_adjacent_merges(
+                resolved, gap_threshold=DEFAULT_MERGE_GAP
+            )
+            merge_index = _index_merges(merge_suggestions)
+            if resolved:
+                if select_index is None:
+                    selected_index = 0
+                else:
+                    selected_index = max(0, min(select_index, len(resolved) - 1))
+            else:
+                selected_index = 0
+            result = _ClipLoadResult(
+                resolved=resolved,
+                groups=groups,
+                overlap_index=overlap_index,
+                merge_suggestions=merge_suggestions,
+                merge_index=merge_index,
+                select_index=selected_index,
+            )
+            self.call_from_thread(self._apply_clip_load_result, generation, result)
 
-        self._clips = resolved
-        self._clip_groups = group_clips_by_video(resolved)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_clip_load_error(self, generation: int, message: str) -> None:
+        if generation != self._clip_load_generation:
+            return
+        if self._clip_list is not None:
+            self._clip_list.clear()
+            self._clip_list.index = None
+        self._set_preview_message(message)
+        self._show_thumbnail_message("Thumbnail: --")
+        self._clear_clip_state()
+
+    def _apply_clip_load_result(self, generation: int, result: _ClipLoadResult) -> None:
+        if generation != self._clip_load_generation:
+            return
+        self._clips = result.resolved
+        self._clip_groups = result.groups
         self._collapsed_groups.intersection_update(
             {group.video_id for group in self._clip_groups}
         )
-        self._overlap_index = _index_overlaps(
-            analyze_overlaps(resolved, heavy_overlap_ratio=DEFAULT_OVERLAP_RATIO)
-        )
-        self._merge_suggestions = plan_adjacent_merges(
-            resolved, gap_threshold=DEFAULT_MERGE_GAP
-        )
-        self._merge_index = _index_merges(self._merge_suggestions)
-        list_view.clear()
+        self._overlap_index = result.overlap_index
+        self._merge_suggestions = result.merge_suggestions
+        self._merge_index = result.merge_index
         self._clip_selection.clear()
-        if resolved:
-            if select_index is None:
-                selected_index = 0
-            else:
-                selected_index = max(0, min(select_index, len(resolved) - 1))
-        else:
-            selected_index = 0
+        selected_index = result.select_index or 0
         self._clip_list_index = selected_index
         self._render_clip_list(selected_index)
 
-        if resolved:
-            self._set_preview(resolved[selected_index])
+        if self._clips:
+            self._set_preview(self._clips[selected_index])
         else:
             self._set_preview_message("No clips found.")
             self._show_thumbnail_message("Thumbnail: --")
@@ -1321,10 +1842,15 @@ class ClipstuiApp(App):
 
     def _list_file_entries(self) -> list[PathEntry]:
         entries: list[PathEntry] = []
-        for entry in self._tree_root.iterdir():
-            if not self._show_hidden and is_hidden(entry):
-                continue
-            entries.append(PathEntry(entry, entry.is_dir()))
+        with os.scandir(self._tree_root) as iterator:
+            for entry in iterator:
+                if not self._show_hidden and _entry_is_hidden(entry):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                entries.append(PathEntry(Path(entry.path), is_dir))
         directories = [entry for entry in entries if entry.is_dir]
         files = [entry for entry in entries if not entry.is_dir]
         directories.sort(key=lambda item: path_sort_key(item.path))
@@ -1399,6 +1925,8 @@ class ClipstuiApp(App):
         buffer = self._file_buffer
         if buffer is None:
             return False
+        if not buffer.has_focus and not self._drive_picker_active:
+            return False
         if self._file_buffer_dirty():
             return False
         if buffer.has_focus and self._file_mode != FileBufferMode.NORMAL:
@@ -1440,8 +1968,28 @@ class ClipstuiApp(App):
             item.output_format,
             on_progress,
             item.cancel_event,
+            output_name=item.output_name,
         )
         self.call_from_thread(self._apply_download_result, item, result)
+
+    def _queue_refresh_interval(self, item_id: int) -> float:
+        if self._queue_list is not None and self._queue_list.has_focus:
+            return 0.12
+        if item_id in self._queue_selection:
+            return 0.2
+        return 0.5
+
+    def _maybe_refresh_preview_from_queue(
+        self, item: QueueItem, now: float, *, force: bool = False
+    ) -> None:
+        if self._selected is None:
+            return
+        if item.resolved != self._selected:
+            return
+        interval = 0.12 if self._queue_list is not None and self._queue_list.has_focus else 0.2
+        if force or now - self._queue_preview_last >= interval:
+            self._queue_preview_last = now
+            self._refresh_preview_text(self._selected, item)
 
     def _apply_download_result(self, item: QueueItem, result: DownloadResult) -> None:
         if result.status == DownloadStatus.CANCELED:
@@ -1463,10 +2011,28 @@ class ClipstuiApp(App):
             item.progress = 100.0
         self._update_queue_item(item, result.status, result.error, result.output_path)
         if result.status == DownloadStatus.DONE and result.output_path:
-            self._set_preview_message(f"Download complete:\n{result.output_path}")
+            sidecar_error = self._write_clip_sidecar(item.resolved, result.output_path)
+            message = f"Download complete:\n{result.output_path}"
+            if sidecar_error:
+                message = f"{message}\nSidecar error: {sidecar_error}"
+            self._set_preview_message(message)
         elif result.status == DownloadStatus.FAILED and result.error:
             self._set_preview_message(f"Download failed:\n{result.error}")
-        self._refresh_preview_if_selected(item)
+
+    def _write_clip_sidecar(self, clip: ResolvedClip, output_path: Path) -> str | None:
+        if not _clip_has_context(clip):
+            return None
+        metadata = self._metadata_cache.get(clip.video_id)
+        payload = _build_clip_sidecar_payload(clip, output_path, metadata)
+        sidecar_path = _sidecar_path(output_path)
+        try:
+            sidecar_path.write_text(
+                json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return str(exc)
+        return None
 
     def _apply_progress_update(self, item: QueueItem, update: ProgressUpdate) -> None:
         if item.pause_requested or item.cancel_requested:
@@ -1481,10 +2047,40 @@ class ClipstuiApp(App):
             item.eta_seconds = update.eta_seconds
         if item.status != DownloadStatus.DOWNLOADING:
             item.status = DownloadStatus.DOWNLOADING
+        now = time.monotonic()
+        item_id = id(item)
+        last_state = self._queue_ui_state.get(item_id)
+        if last_state is None:
+            last_time = 0.0
+            last_percent = None
+            last_speed = None
+            last_eta = None
+            last_status = item.status
+        else:
+            last_time, last_percent, last_speed, last_eta, last_status = last_state
+        status_changed = last_state is None or last_status != item.status
+        metrics_changed = (
+            last_percent != item.progress
+            or last_speed != item.speed_bps
+            or last_eta != item.eta_seconds
+        )
+        if not status_changed and not metrics_changed:
+            return
+        interval = self._queue_refresh_interval(item_id)
+        if not status_changed and now - last_time < interval:
+            self._maybe_refresh_preview_from_queue(item, now)
+            return
+        self._queue_ui_state[item_id] = (
+            now,
+            item.progress,
+            item.speed_bps,
+            item.eta_seconds,
+            item.status,
+        )
         widget = self._queue_widgets.get(id(item))
         if widget is not None:
             widget.refresh_label()
-        self._refresh_preview_if_selected(item)
+        self._maybe_refresh_preview_from_queue(item, now)
 
     def _update_queue_item(
         self,
@@ -1501,16 +2097,37 @@ class ClipstuiApp(App):
         widget = self._queue_widgets.get(id(item))
         if widget is not None:
             widget.refresh_label()
-        self._refresh_preview_if_selected(item)
+        now = time.monotonic()
+        self._queue_ui_state[id(item)] = (
+            now,
+            item.progress,
+            item.speed_bps,
+            item.eta_seconds,
+            item.status,
+        )
+        self._maybe_refresh_preview_from_queue(item, now, force=True)
 
     def _set_preview(self, clip: ResolvedClip) -> None:
         if self._preview_text is None:
             return
         self._selected = clip
+        self._selected_group_video_id = None
         self._ensure_metadata(clip)
         queue_item = self._latest_queue_item_for_clip(clip)
         self._refresh_preview_text(clip, queue_item)
         self._refresh_thumbnail(clip)
+
+    def _set_group_preview(self, group: ClipGroup) -> None:
+        if self._preview_text is None:
+            return
+        self._selected = None
+        self._selected_group_video_id = group.video_id
+        if group.clips:
+            self._ensure_metadata(group.clips[0])
+        metadata = self._metadata_cache.get(group.video_id)
+        title = _group_title(metadata)
+        self._set_preview_message(_format_group_preview(group, title))
+        self._show_group_thumbnail(group.video_id)
 
     def _schedule_preview(self, clip: ResolvedClip) -> None:
         self._pending_preview = clip
@@ -1543,11 +2160,11 @@ class ClipstuiApp(App):
         output_dir = self._output_dir()
         if self.clip_path:
             self._file_status.update(
-                f"Root:\n{self._tree_root}\n\nFile:\n{self.clip_path}\n\nOutput:\n{output_dir}\n\nFormat:\n.{self.output_format}"
+                f"Root:\n{self._tree_root}\n\nFile:\n{self.clip_path}\n\nOutput:\n{output_dir}\n\nFormat:\n.{self.output_format}\n\nTemplate:\n{self.output_template}"
             )
         else:
             self._file_status.update(
-                f"Root:\n{self._tree_root}\n\nFile:\n(none)\n\nOutput:\n{output_dir}\n\nFormat:\n.{self.output_format}"
+                f"Root:\n{self._tree_root}\n\nFile:\n(none)\n\nOutput:\n{output_dir}\n\nFormat:\n.{self.output_format}\n\nTemplate:\n{self.output_template}"
             )
 
     def _update_mode_status(self, message: str | None = None) -> None:
@@ -1593,6 +2210,34 @@ class ClipstuiApp(App):
         if self._selected is not None:
             self._set_preview(self._selected)
         self._set_preview_message(f"Output format set: .{self.output_format}")
+
+    def _handle_output_template(self, result: str | None) -> None:
+        if result is None:
+            return
+        self.output_template = result
+        self._output_template_override = True
+        self._update_left_status()
+        if self._selected is not None:
+            self._set_preview(self._selected)
+        self._set_preview_message("Output template updated.")
+
+    def _handle_command_palette(
+        self,
+        action_id: str | None,
+        handlers: dict[str, Callable[[], None]],
+    ) -> None:
+        if action_id is None:
+            return
+        handler = handlers.get(action_id)
+        if handler is None:
+            self._set_preview_message("Command not found.")
+            return
+        handler()
+
+    def _handle_preset(self, preset: PresetProfile | None) -> None:
+        if preset is None:
+            return
+        self._apply_preset_profile(preset, show_message=True)
 
     def _handle_tree_root(self, result: Path | None) -> None:
         if result is None:
@@ -2270,15 +2915,18 @@ class ClipstuiApp(App):
             highlight_clip = self._clips[selected_index]
         if highlight_clip is not None:
             self._collapsed_groups.discard(highlight_clip.video_id)
-        list_view.clear()
+        items: list[ListItem] = []
         highlight_index: int | None = None
         for group in self._clip_groups:
             collapsed = group.video_id in self._collapsed_groups
-            title = _group_title(self._metadata_cache.get(group.video_id))
+            metadata = self._metadata_cache.get(group.video_id)
+            title = _group_title(metadata)
+            if group.clips:
+                self._ensure_metadata(group.clips[0])
             group_item = ClipGroupItem(group, collapsed, title)
-            list_view.append(group_item)
+            items.append(group_item)
             if highlight_video == group.video_id and highlight_clip is None:
-                highlight_index = len(list_view.children) - 1
+                highlight_index = len(items) - 1
             if collapsed:
                 continue
             for clip in group.clips:
@@ -2288,25 +2936,30 @@ class ClipstuiApp(App):
                     selected=clip in self._clip_selection,
                     warning=warning,
                 )
-                list_view.append(item)
+                items.append(item)
                 if highlight_clip == clip:
-                    highlight_index = len(list_view.children) - 1
+                    highlight_index = len(items) - 1
         if highlight_index is None:
-            for idx, child in enumerate(list_view.children):
+            for idx, child in enumerate(items):
                 if isinstance(child, ClipListItem):
                     highlight_index = idx
                     break
-            if highlight_index is None and list_view.children:
+            if highlight_index is None and items:
                 highlight_index = 0
-        if highlight_index is not None:
-            list_view.index = highlight_index
+        list_view.clear()
+        if items:
+            list_view.extend(items)
+            if highlight_index is not None:
+                list_view.index = highlight_index
+        else:
+            list_view.index = None
         if highlight_clip is not None:
             try:
                 self._clip_list_index = self._clips.index(highlight_clip)
             except ValueError:
                 pass
-        elif highlight_index is not None:
-            child = list_view.children[highlight_index]
+        elif highlight_index is not None and 0 <= highlight_index < len(items):
+            child = items[highlight_index]
             if isinstance(child, ClipListItem):
                 try:
                     self._clip_list_index = self._clips.index(child.resolved)
@@ -2448,10 +3101,42 @@ class ClipstuiApp(App):
         if widget is not None:
             widget.refresh_label()
 
+    def _ensure_download_workers(self) -> None:
+        if self._download_workers_started:
+            return
+        self._download_queue = queue.Queue()
+        for _ in range(self._max_parallel_downloads):
+            threading.Thread(target=self._download_worker, daemon=True).start()
+        self._download_workers_started = True
+
+    def _download_worker(self) -> None:
+        if self._download_queue is None:
+            return
+        while True:
+            item = self._download_queue.get()
+            self._download_pending.discard(id(item))
+            if (
+                item.status != DownloadStatus.QUEUED
+                or item.pause_requested
+                or item.cancel_requested
+                or item.cancel_event.is_set()
+            ):
+                self._download_queue.task_done()
+                continue
+            self._download_queue_item(item)
+            self._download_queue.task_done()
+
     def _start_queue_item(self, item: QueueItem) -> None:
         if item.status != DownloadStatus.QUEUED:
             return
-        threading.Thread(target=self._download_queue_item, args=(item,), daemon=True).start()
+        item_id = id(item)
+        if item_id in self._download_pending:
+            return
+        self._ensure_download_workers()
+        if self._download_queue is None:
+            return
+        self._download_pending.add(item_id)
+        self._download_queue.put(item)
 
     def _pause_queue_item(self, item: QueueItem) -> None:
         if item.status not in {DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING}:
@@ -2529,7 +3214,10 @@ class ClipstuiApp(App):
         queue_list = self._queue_list
         if queue_list is None:
             return
-        item = QueueItem(resolved=clip, output_format=self.output_format)
+        metadata = self._metadata_cache.get(clip.video_id)
+        title = metadata.title if metadata and metadata.title else None
+        output_name = self._output_basename_for_clip(clip, title)
+        item = QueueItem(resolved=clip, output_name=output_name, output_format=self.output_format)
         self._queue_items.append(item)
         widget = QueueListItem(item, selected=False)
         self._queue_widgets[id(item)] = widget
@@ -2624,16 +3312,386 @@ class ClipstuiApp(App):
         if self._clip_list is not None:
             self._clip_list.focus()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "download_all_button":
-            self.action_download_all()
-
     def _output_dir(self) -> Path:
         if self.output_dir:
             return self.output_dir
         if self.clip_path:
             return self.clip_path.parent
         return Path.cwd()
+
+    def _load_clip_on_startup(self) -> None:
+        if self.clip_path and self.clip_path.is_file():
+            self.load_clip_file(self.clip_path)
+
+    def _ensure_player_command(self) -> str | None:
+        if self._player_command is None:
+            self._player_command = shutil.which("mpv") or shutil.which("vlc")
+        return self._player_command
+
+    def _ensure_chafa_path(self) -> str | None:
+        if self._chafa_path is None:
+            self._chafa_path = shutil.which("chafa")
+        return self._chafa_path
+
+    def _export_target_clips(self) -> tuple[list[ResolvedClip], str]:
+        if not self._clips:
+            self._set_preview_message("No clips loaded.")
+            return ([], "none")
+        if self._clip_selection:
+            clips = [clip for clip in self._clips if clip in self._clip_selection]
+            if not clips:
+                self._set_preview_message("No selected clips found.")
+                return ([], "none")
+            return (clips, "selected")
+        return (list(self._clips), "all")
+
+    def _default_export_basename(self, suffix: str) -> str:
+        if self.clip_path:
+            stem = self.clip_path.stem.strip()
+            if stem:
+                suffix_lower = suffix.lower()
+                if stem.lower().endswith(f"_{suffix_lower}"):
+                    return stem
+                return f"{stem}_{suffix}"
+        return suffix
+
+    def _unique_manifest_basename(self, output_dir: Path, base_name: str) -> str:
+        candidate = base_name
+        for index in range(1000):
+            csv_path = output_dir / f"{candidate}.csv"
+            json_path = output_dir / f"{candidate}.json"
+            if not csv_path.exists() and not json_path.exists():
+                return candidate
+            candidate = f"{base_name}_{index + 1}"
+        return base_name
+
+    def _unique_export_path(self, path: Path, *, is_dir: bool) -> Path:
+        if not path.exists():
+            return path
+        stem = path.name if is_dir else path.stem
+        suffix = "" if is_dir else path.suffix
+        for index in range(1, 1000):
+            candidate = path.with_name(f"{stem}_{index}{suffix}")
+            if not candidate.exists():
+                return candidate
+        return path
+
+    def _unique_child_path(self, root: Path, filename: str) -> Path:
+        path = root / filename
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        for index in range(1, 1000):
+            candidate = root / f"{stem}_{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+        return path
+
+    def _resolve_action_target(self) -> tuple[ResolvedClip, QueueItem | None] | None:
+        if self._queue_list is not None and self._queue_list.has_focus:
+            queue_widget = self._current_queue_list_item()
+            if queue_widget is not None:
+                return (queue_widget.item.resolved, queue_widget.item)
+        item = self._current_clip_list_item()
+        if item is not None:
+            clip = item.resolved
+            return (clip, self._latest_queue_item_for_clip(clip))
+        if self._selected is not None:
+            return (self._selected, self._latest_queue_item_for_clip(self._selected))
+        return None
+
+    def _resolve_output_path(
+        self, clip: ResolvedClip, queue_item: QueueItem | None
+    ) -> Path | None:
+        if queue_item is not None and queue_item.output_path:
+            return queue_item.output_path
+        output_format = queue_item.output_format if queue_item else self.output_format
+        if queue_item is not None:
+            output_name = queue_item.output_name
+        else:
+            metadata = self._metadata_cache.get(clip.video_id)
+            title = metadata.title if metadata and metadata.title else None
+            output_name = self._output_basename_for_clip(clip, title)
+        ext = output_format.lower().lstrip(".")
+        return self._output_dir() / f"{output_name}.{ext}"
+
+    def _command_palette_entries(self) -> list[tuple[CommandAction, Callable[[], None]]]:
+        entries: list[tuple[CommandAction, Callable[[], None]]] = [
+            (
+                CommandAction(
+                    "download_selected",
+                    "Download selected clips",
+                    "Queue selected or current clip",
+                    "download queue",
+                ),
+                self.action_download,
+            ),
+            (
+                CommandAction(
+                    "download_all",
+                    "Download all clips",
+                    "Queue every clip in file",
+                    "download queue",
+                ),
+                self.action_download_all,
+            ),
+            (
+                CommandAction(
+                    "download_failed",
+                    "Download failed clips",
+                    "Queue failed for selection",
+                    "download failed",
+                ),
+                self.action_download_failed,
+            ),
+            (
+                CommandAction(
+                    "retry_failed",
+                    "Retry failed downloads",
+                    "Restart failed queue items",
+                    "retry failed",
+                ),
+                self.action_retry_failed,
+            ),
+            (
+                CommandAction(
+                    "retry_failed_video",
+                    "Retry failed for current video",
+                    "Restart failed for current video",
+                    "retry failed",
+                ),
+                self.action_retry_failed_video,
+            ),
+            (
+                CommandAction(
+                    "open_output",
+                    "Open output in player",
+                    "Open downloaded clip via mpv/vlc",
+                    "player mpv vlc",
+                ),
+                self.action_open_in_player,
+            ),
+            (
+                CommandAction(
+                    "open_youtube",
+                    "Open YouTube at clip start",
+                    "Open in browser",
+                    "youtube browser",
+                ),
+                self.action_open_youtube,
+            ),
+            (
+                CommandAction(
+                    "export_manifest",
+                    "Export manifest (CSV/JSON)",
+                    "Write clip list to output dir",
+                    "export manifest csv json",
+                ),
+                self.action_export_manifest,
+            ),
+            (
+                CommandAction(
+                    "export_concat",
+                    "Export concat list",
+                    "ffmpeg concat file in output dir",
+                    "concat ffmpeg",
+                ),
+                self.action_export_concat,
+            ),
+            (
+                CommandAction(
+                    "rally_pack",
+                    "Create rally pack",
+                    "Copy outputs + concat list",
+                    "rally pack",
+                ),
+                self.action_rally_pack,
+            ),
+            (
+                CommandAction(
+                    "output_dir",
+                    "Set output directory",
+                    "Change download folder",
+                    "output directory",
+                ),
+                self.action_output_dir,
+            ),
+            (
+                CommandAction(
+                    "output_format",
+                    "Set output format",
+                    "mp4/mkv/webm",
+                    "output format",
+                ),
+                self.action_output_format,
+            ),
+            (
+                CommandAction(
+                    "output_template",
+                    "Set output template",
+                    "Customize filenames",
+                    "output template",
+                ),
+                self.action_output_template,
+            ),
+            (
+                CommandAction(
+                    "preset",
+                    "Load preset profile",
+                    "Apply pad/format/template defaults",
+                    "preset profile",
+                ),
+                self.action_preset,
+            ),
+            (
+                CommandAction(
+                    "pad_global",
+                    "Set global pad",
+                    "Defaults for all clips",
+                    "pad",
+                ),
+                self.action_pad_global,
+            ),
+            (
+                CommandAction(
+                    "pad_video",
+                    "Set pad for current video",
+                    "Apply to current video",
+                    "pad",
+                ),
+                self.action_pad_video,
+            ),
+            (
+                CommandAction(
+                    "pad_selected",
+                    "Set pad for selected clips",
+                    "Apply to selected clips",
+                    "pad",
+                ),
+                self.action_pad_selected,
+            ),
+            (
+                CommandAction(
+                    "normalize_pads",
+                    "Normalize pad overrides",
+                    "Clear overrides matching defaults",
+                    "pad normalize",
+                ),
+                self.action_normalize_pads,
+            ),
+            (
+                CommandAction(
+                    "merge_adjacent",
+                    "Merge adjacent clips",
+                    "Merge when close in time",
+                    "merge",
+                ),
+                self.action_merge_adjacent,
+            ),
+            (
+                CommandAction(
+                    "toggle_tag_prefix",
+                    "Toggle auto-tag prefix",
+                    "Prefix tags by video",
+                    "tag",
+                ),
+                self.action_toggle_tag_prefix,
+            ),
+            (
+                CommandAction(
+                    "search",
+                    "Search files",
+                    "Fuzzy search in file tree",
+                    "search files",
+                ),
+                self.action_search,
+            ),
+            (
+                CommandAction(
+                    "reload",
+                    "Reload clip file",
+                    "Re-parse current clip file",
+                    "reload",
+                ),
+                self.action_reload,
+            ),
+            (
+                CommandAction(
+                    "help",
+                    "Show help",
+                    "Open help screen",
+                    "help",
+                ),
+                self.action_help,
+            ),
+            (
+                CommandAction(
+                    "quit",
+                    "Quit",
+                    "Exit the application",
+                    "quit exit",
+                ),
+                self.exit,
+            ),
+        ]
+        return entries
+
+    def _resolve_preset_output_dir(self, target: Path) -> Path:
+        target = Path(target).expanduser()
+        if target.is_absolute():
+            return target
+        base = self.clip_path.parent if self.clip_path else Path.cwd()
+        return base / target
+
+    def _output_basename_for_clip(self, clip: ResolvedClip, title: str | None) -> str:
+        try:
+            return format_output_basename(self.output_template, clip, title=title)
+        except ValueError:
+            return clip.output_name
+
+    def _apply_preset_profile(self, preset: PresetProfile, *, show_message: bool) -> None:
+        pad_changed = False
+        errors: list[str] = []
+        if preset.pad_before is not None:
+            self._pad_before_default = preset.pad_before
+            pad_changed = True
+        if preset.pad_after is not None:
+            self._pad_after_default = preset.pad_after
+            pad_changed = True
+        if preset.output_format:
+            normalized = _normalize_output_format(preset.output_format)
+            if _is_valid_output_format(normalized):
+                self.output_format = normalized
+                self._output_format_override = True
+            else:
+                errors.append(f"Invalid format: {preset.output_format}")
+        if preset.output_template:
+            try:
+                validate_output_template(preset.output_template)
+                self.output_template = preset.output_template
+                self._output_template_override = True
+            except ValueError as exc:
+                errors.append(str(exc))
+        if preset.output_dir:
+            try:
+                resolved_dir = self._resolve_preset_output_dir(preset.output_dir)
+                resolved_dir.mkdir(parents=True, exist_ok=True)
+                self.output_dir = resolved_dir
+                self._output_dir_override = True
+            except OSError as exc:
+                errors.append(f"Output dir error: {exc}")
+
+        self._update_left_status()
+        if pad_changed and self.clip_path:
+            self.load_clip_file(self.clip_path, select_index=self._clip_list_index)
+        elif self._selected is not None:
+            self._set_preview(self._selected)
+        if show_message:
+            message = f"Preset applied: {preset.name}"
+            if errors:
+                message = f"{message}\n" + "\n".join(errors)
+            self._set_preview_message(message)
 
     def _latest_queue_item_for_clip(self, clip: ResolvedClip) -> QueueItem | None:
         for item in reversed(self._queue_items):
@@ -2648,10 +3706,13 @@ class ClipstuiApp(App):
         metadata_error = self._metadata_errors.get(clip.video_id)
         warnings = self._overlap_index.get(clip, [])
         merges = self._merge_index.get(clip, [])
+        title = metadata.title if metadata and metadata.title else None
+        output_name = item.output_name if item else self._output_basename_for_clip(clip, title)
         self._preview_text.update(
             _format_preview(
                 clip,
                 item,
+                output_name,
                 self.output_format,
                 metadata,
                 metadata_error,
@@ -2665,15 +3726,29 @@ class ClipstuiApp(App):
         if video_id in self._metadata_cache or video_id in self._metadata_loading:
             return
         self._metadata_loading.add(video_id)
+        self._ensure_metadata_worker()
+        if self._metadata_queue is None:
+            return
+        self._metadata_queue.put((video_id, clip.clip.start_url))
 
-        def worker() -> None:
+    def _ensure_metadata_worker(self) -> None:
+        if self._metadata_worker_started:
+            return
+        self._metadata_queue = queue.Queue()
+        threading.Thread(target=self._metadata_worker, daemon=True).start()
+        self._metadata_worker_started = True
+
+    def _metadata_worker(self) -> None:
+        if self._metadata_queue is None:
+            return
+        while True:
+            video_id, start_url = self._metadata_queue.get()
             try:
-                metadata = get_metadata(clip.clip.start_url)
+                metadata = get_metadata(start_url)
                 self.call_from_thread(self._apply_metadata, video_id, metadata, None)
             except Exception as exc:
                 self.call_from_thread(self._apply_metadata, video_id, None, str(exc))
-
-        threading.Thread(target=worker, daemon=True).start()
+            self._metadata_queue.task_done()
 
     def _apply_metadata(
         self,
@@ -2685,14 +3760,106 @@ class ClipstuiApp(App):
         if metadata is not None:
             self._metadata_cache[video_id] = metadata
             self._metadata_errors.pop(video_id, None)
+            self._ensure_video_thumbnail(video_id, metadata.thumbnail_url)
         if error:
             self._metadata_errors[video_id] = error
         self._refresh_group_label(video_id)
+        if self._selected_group_video_id == video_id:
+            group = next(
+                (entry for entry in self._clip_groups if entry.video_id == video_id),
+                None,
+            )
+            title = _group_title(metadata)
+            if group is not None:
+                self._set_preview_message(_format_group_preview(group, title))
+            self._show_group_thumbnail(video_id)
         if self._selected is None or self._selected.video_id != video_id:
             return
         queue_item = self._latest_queue_item_for_clip(self._selected)
         self._refresh_preview_text(self._selected, queue_item)
         self._refresh_thumbnail(self._selected)
+
+    def _ensure_video_thumbnail(self, video_id: str, thumbnail_url: str | None) -> None:
+        if not thumbnail_url:
+            return
+        cached = self._video_thumb_cache.get(video_id)
+        if cached is not None and not cached.exists():
+            self._video_thumb_cache.pop(video_id, None)
+        if (
+            video_id in self._video_thumb_cache
+            or video_id in self._video_thumb_loading
+            or video_id in self._video_thumb_errors
+        ):
+            return
+        self._video_thumb_loading.add(video_id)
+        self._ensure_video_thumb_worker()
+        if self._video_thumb_queue is None:
+            return
+        self._video_thumb_queue.put((video_id, thumbnail_url))
+
+    def _ensure_video_thumb_worker(self) -> None:
+        if self._video_thumb_worker_started:
+            return
+        self._video_thumb_queue = queue.LifoQueue()
+        threading.Thread(target=self._video_thumb_worker, daemon=True).start()
+        self._video_thumb_worker_started = True
+
+    def _video_thumb_worker(self) -> None:
+        if self._video_thumb_queue is None:
+            return
+        while True:
+            video_id, url = self._video_thumb_queue.get()
+            try:
+                path = download_thumbnail(url, video_id)
+                self.call_from_thread(self._apply_video_thumbnail, video_id, path, None)
+            except Exception as exc:
+                self.call_from_thread(self._apply_video_thumbnail, video_id, None, str(exc))
+            self._video_thumb_queue.task_done()
+
+    def _apply_video_thumbnail(
+        self, video_id: str, path: Path | None, error: str | None
+    ) -> None:
+        self._video_thumb_loading.discard(video_id)
+        if path is not None:
+            self._video_thumb_cache[video_id] = path
+            self._video_thumb_errors.pop(video_id, None)
+        if error:
+            self._video_thumb_errors[video_id] = error
+        self._refresh_group_thumbnail(video_id)
+
+    def _refresh_group_thumbnail(self, video_id: str) -> None:
+        if self._selected_group_video_id != video_id:
+            return
+        self._show_group_thumbnail(video_id)
+
+    def _show_group_thumbnail(self, video_id: str) -> None:
+        if self._thumb_image is None or self._thumb_fallback is None:
+            return
+        thumb_error = self._video_thumb_errors.get(video_id)
+        if thumb_error:
+            self._show_thumbnail_message(f"Thumbnail error: {_short_error(thumb_error)}")
+            return
+        thumb_path = self._video_thumb_cache.get(video_id)
+        if thumb_path is not None and thumb_path.exists():
+            try:
+                _update_image_widget(self._thumb_image, thumb_path)
+            except Exception as exc:
+                message = str(exc)
+                self._video_thumb_errors[video_id] = message
+                self._show_thumbnail_message(f"Thumbnail error: {_short_error(message)}")
+                return
+            self._thumb_image.remove_class("hidden")
+            self._thumb_fallback.add_class("hidden")
+            return
+        metadata = self._metadata_cache.get(video_id)
+        if metadata is not None:
+            self._ensure_video_thumbnail(video_id, metadata.thumbnail_url)
+            if metadata.thumbnail_url:
+                self._show_thumbnail_message("Thumbnail: loading...")
+            else:
+                self._show_thumbnail_message("Thumbnail: --")
+        else:
+            self._show_thumbnail_message("Thumbnail: --")
 
     def _refresh_thumbnail(self, clip: ResolvedClip) -> None:
         if self._thumb_image is None or self._thumb_fallback is None:
@@ -2706,9 +3873,10 @@ class ClipstuiApp(App):
         if thumb_path is not None and thumb_path.exists():
             if self._show_thumbnail_image(key, thumb_path):
                 return
-            if self._show_chafa_thumbnail(key, thumb_path):
+            chafa_path = self._ensure_chafa_path()
+            if chafa_path and self._show_chafa_thumbnail(key, thumb_path):
                 return
-            if self._chafa_path:
+            if chafa_path:
                 self._show_thumbnail_message("Thumbnail: unavailable (chafa failed)")
             else:
                 self._show_thumbnail_message("Thumbnail: unavailable (install chafa)")
@@ -2724,19 +3892,29 @@ class ClipstuiApp(App):
         if key in self._thumb_cache or key in self._thumb_loading:
             return
         self._thumb_loading.add(key)
+        self._ensure_thumb_worker()
+        if self._thumb_queue is None:
+            return
+        self._thumb_queue.put((key, clip.clip.start_url, clip.video_id, clip.start_sec))
 
-        def worker() -> None:
+    def _ensure_thumb_worker(self) -> None:
+        if self._thumb_worker_started:
+            return
+        self._thumb_queue = queue.LifoQueue()
+        threading.Thread(target=self._thumb_worker, daemon=True).start()
+        self._thumb_worker_started = True
+
+    def _thumb_worker(self) -> None:
+        if self._thumb_queue is None:
+            return
+        while True:
+            key, url, video_id, start_sec = self._thumb_queue.get()
             try:
-                path = generate_clip_thumbnail(
-                    clip.clip.start_url,
-                    clip.video_id,
-                    clip.start_sec,
-                )
+                path = generate_clip_thumbnail(url, video_id, start_sec)
                 self.call_from_thread(self._apply_thumbnail, key, path, None)
             except Exception as exc:
                 self.call_from_thread(self._apply_thumbnail, key, None, str(exc))
-
-        threading.Thread(target=worker, daemon=True).start()
+            self._thumb_queue.task_done()
 
     def _apply_thumbnail(
         self, key: tuple[str, str], path: Path | None, error: str | None
@@ -2798,9 +3976,12 @@ class ClipstuiApp(App):
     def _show_chafa_thumbnail(self, key: tuple[str, str], path: Path) -> bool:
         if self._thumb_fallback is None or self._thumb_image is None:
             return False
+        chafa_path = self._ensure_chafa_path()
+        if not chafa_path:
+            return False
         cached = self._thumb_fallback_cache.get(key)
         if cached is None:
-            cached = _render_chafa_output(self._chafa_path, path)
+            cached = _render_chafa_output(chafa_path, path)
             if cached is None:
                 return False
             self._thumb_fallback_cache[key] = cached
@@ -2823,27 +4004,28 @@ _UNSELECTED_ICON = ""
 
 def _format_list_label(clip: ResolvedClip, selected: bool, warning: bool) -> Text:
     tag = clip.display_tag or "-"
+    label_tag = f" [{clip.clip.label}]" if clip.clip.label else ""
     warning_icon = "!" if warning else " "
     label = Text()
     label.append(_SELECTED_ICON if selected else _UNSELECTED_ICON, style=_clip_selection_style(selected))
     label.append(" ")
-    label.append(warning_icon, style="yellow" if warning else "dim")
+    label.append(warning_icon, style="#e0af68" if warning else "dim")
     label.append(" ")
     label.append(
-        f"{tag} | {clip.video_id} | "
+        f"{tag}{label_tag} | {clip.video_id} | "
         f"{format_seconds(clip.start_sec)}-{format_seconds(clip.end_sec)}"
     )
     return label
 
 
 def _clip_selection_style(selected: bool) -> str:
-    return "bold" if selected else "dim"
+    return "bold #9ece6a" if selected else "#a9b1d6"
 
 
 def _format_queue_label(item: QueueItem, selected: bool = False) -> str:
     marker = "(x)" if selected else "( )"
     status = item.status.value.upper()
-    filename = _format_output_name(item.resolved.output_name, item.output_format)
+    filename = _format_output_name(item.output_name, item.output_format)
     label = f"{marker} {status:11} {filename}"
     meta_parts = []
     percent = _format_percent(item.progress)
@@ -2867,12 +4049,12 @@ def _format_group_label(group: ClipGroup, collapsed: bool, title: str | None) ->
     count = len(group.clips)
     duration = _format_total_duration(group.total_duration)
     label = Text()
-    label.append(icon, style="bold")
+    label.append(icon, style="bold #7dcfff")
     label.append(" ")
-    label.append(group.video_id, style="bold")
+    label.append(group.video_id, style="bold #e0af68")
     if title:
-        label.append(f" | {title}")
-    label.append(f" | {count} clips | {duration}")
+        label.append(f" | {title}", style="#c0caf5")
+    label.append(f" | {count} clips | {duration}", style="#a9b1d6")
     return label
 
 
@@ -2888,7 +4070,7 @@ def _format_group_preview(group: ClipGroup, title: str | None) -> str:
 
 def _progress_value(item: QueueItem) -> float | None:
     if item.progress is None:
-        return None
+        return 0.0
     return max(0.0, min(100.0, item.progress))
 
 
@@ -2934,6 +4116,7 @@ def _short_error(message: str) -> str:
 def _format_preview(
     clip: ResolvedClip,
     item: QueueItem | None,
+    output_name: str,
     default_format: str,
     metadata: VideoMetadata | None,
     metadata_error: str | None,
@@ -2941,8 +4124,13 @@ def _format_preview(
     merges: list[MergeSuggestion] | None,
 ) -> str:
     tag = _format_tag_label(clip)
+    label_value = _format_preview_value(clip.clip.label)
+    rotation = _format_preview_value(clip.clip.rotation)
+    score = _format_preview_value(clip.clip.score)
+    opponent = _format_preview_value(clip.clip.opponent)
+    serve_target = _format_preview_value(clip.clip.serve_target)
     output_format = item.output_format if item else default_format
-    output_name = _format_output_name(clip.output_name, output_format)
+    output_name = _format_output_name(output_name, output_format)
     title = metadata.title if metadata and metadata.title else "--"
     uploader = metadata.uploader if metadata and metadata.uploader else "--"
     duration = _format_duration(metadata.duration) if metadata else None
@@ -2958,6 +4146,11 @@ def _format_preview(
             f"Duration: {_format_preview_value(duration)}",
             "",
             f"Tag: {tag}",
+            f"Label: {label_value}",
+            f"Rotation: {rotation}",
+            f"Score: {score}",
+            f"Opponent: {opponent}",
+            f"Serve Target: {serve_target}",
             f"Video ID: {clip.video_id}",
             f"Start: {format_seconds(clip.start_sec)}",
             f"End: {format_seconds(clip.end_sec)}",
@@ -2998,6 +4191,53 @@ def _format_preview(
         ]
     )
     return "\n".join(lines)
+
+
+def _clip_has_context(clip: ResolvedClip) -> bool:
+    return any(
+        [
+            clip.clip.label,
+            clip.clip.rotation,
+            clip.clip.score,
+            clip.clip.opponent,
+            clip.clip.serve_target,
+        ]
+    )
+
+
+def _build_clip_sidecar_payload(
+    clip: ResolvedClip,
+    output_path: Path,
+    metadata: VideoMetadata | None,
+) -> dict[str, object]:
+    tag = clip.display_tag if clip.display_tag is not None else clip.clip.tag
+    return {
+        "tag": tag,
+        "label": clip.clip.label,
+        "rotation": clip.clip.rotation,
+        "score": clip.clip.score,
+        "opponent": clip.clip.opponent,
+        "serve_target": clip.clip.serve_target,
+        "video_id": clip.video_id,
+        "start_sec": clip.start_sec,
+        "end_sec": clip.end_sec,
+        "cut_start": clip.cut_start,
+        "cut_end": clip.cut_end,
+        "start_url": clip.clip.start_url,
+        "end_url": clip.clip.end_url,
+        "output_file": output_path.name,
+        "output_path": str(output_path),
+        "title": metadata.title if metadata and metadata.title else None,
+        "uploader": metadata.uploader if metadata and metadata.uploader else None,
+        "webpage_url": metadata.webpage_url if metadata and metadata.webpage_url else None,
+    }
+
+
+def _sidecar_path(output_path: Path) -> Path:
+    suffix = output_path.suffix
+    if suffix:
+        return output_path.with_suffix(f"{suffix}.clip.json")
+    return output_path.with_suffix(".clip.json")
 
 
 def _format_preview_value(value: str | None) -> str:
@@ -3099,6 +4339,11 @@ def _apply_pad_updates(
             start_url=spec.start_url,
             end_url=spec.end_url,
             tag=spec.tag,
+            label=spec.label,
+            rotation=spec.rotation,
+            score=spec.score,
+            opponent=spec.opponent,
+            serve_target=spec.serve_target,
             pad_before=new_before,
             pad_after=new_after,
         )
@@ -3118,6 +4363,11 @@ def _normalize_pad_overrides(
                 start_url=spec.start_url,
                 end_url=spec.end_url,
                 tag=spec.tag,
+                label=spec.label,
+                rotation=spec.rotation,
+                score=spec.score,
+                opponent=spec.opponent,
+                serve_target=spec.serve_target,
                 pad_before=None,
                 pad_after=None,
             )
@@ -3229,6 +4479,17 @@ def _format_output_name(base: str, output_format: str) -> str:
     return f"{base}.{ext}"
 
 
+def _entry_is_hidden(entry: os.DirEntry) -> bool:
+    if entry.name.startswith("."):
+        return True
+    try:
+        attrs = entry.stat(follow_symlinks=False).st_file_attributes
+    except OSError:
+        return False
+    hidden_flag = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0)
+    return bool(attrs & hidden_flag)
+
+
 def _format_entry_line(root: Path, entry: PathEntry) -> str:
     rel = entry.path.relative_to(root)
     text = rel.as_posix()
@@ -3267,14 +4528,26 @@ def main() -> None:
     parser.add_argument("clip_file", nargs="?", help="Path to clip file")
     parser.add_argument("--output-dir", help="Output directory for downloads")
     parser.add_argument("--output-format", help="Output format, e.g. mp4 or mkv")
+    parser.add_argument("--output-template", help="Output filename template")
+    parser.add_argument("--preset", help="Preset profile name")
     args = parser.parse_args()
     path = Path(args.clip_file).expanduser() if args.clip_file else None
     output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
-    ClipstuiApp(
-        clip_path=path,
-        output_dir=output_dir,
-        output_format=args.output_format,
-    ).run()
+    preset = find_preset(args.preset) if args.preset else None
+    if args.preset and preset is None:
+        names = ", ".join(preset.name for preset in list_presets()) or "none"
+        parser.error(f"Unknown preset: {args.preset}. Available: {names}")
+    try:
+        app = ClipstuiApp(
+            clip_path=path,
+            output_dir=output_dir,
+            output_format=args.output_format,
+            output_template=args.output_template,
+            preset=preset,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    app.run()
 
 
 

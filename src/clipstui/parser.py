@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 
 
@@ -8,6 +9,11 @@ class ClipSpec:
     start_url: str
     end_url: str
     tag: str | None = None
+    label: str | None = None
+    rotation: str | None = None
+    score: str | None = None
+    opponent: str | None = None
+    serve_target: str | None = None
     pad_before: int | None = None
     pad_after: int | None = None
 
@@ -29,7 +35,7 @@ def parse_clip_file(text: str) -> list[ClipSpec]:
         if parts[0] != "CLIP":
             raise ValueError(f"Unexpected content on line {index}: {stripped}")
 
-        tag = parts[1].strip() if len(parts) > 1 else None
+        tag, fields = _parse_clip_header(stripped, index)
         pad_before = None
         pad_after = None
 
@@ -45,6 +51,11 @@ def parse_clip_file(text: str) -> list[ClipSpec]:
                 start_url=start_url,
                 end_url=end_url,
                 tag=tag,
+                label=fields.get("label"),
+                rotation=fields.get("rotation"),
+                score=fields.get("score"),
+                opponent=fields.get("opponent"),
+                serve_target=fields.get("serve_target"),
                 pad_before=pad_before,
                 pad_after=pad_after,
             )
@@ -87,10 +98,7 @@ def _parse_pad_line(line: str, line_no: int) -> tuple[int, int]:
 def format_clip_file(clips: list[ClipSpec]) -> str:
     lines: list[str] = []
     for clip in clips:
-        header = "CLIP"
-        if clip.tag:
-            header = f"{header} {clip.tag}"
-        lines.append(header)
+        lines.append(_format_clip_header(clip))
         if clip.pad_before is not None or clip.pad_after is not None:
             before = clip.pad_before or 0
             after = clip.pad_after or 0
@@ -101,3 +109,74 @@ def format_clip_file(clips: list[ClipSpec]) -> str:
     if not lines:
         return ""
     return "\n".join(lines).rstrip() + "\n"
+
+
+_CLIP_FIELD_ALIASES = {
+    "label": "label",
+    "rotation": "rotation",
+    "score": "score",
+    "opponent": "opponent",
+    "serve_target": "serve_target",
+    "serve": "serve_target",
+}
+
+
+def _parse_clip_header(line: str, line_no: int) -> tuple[str | None, dict[str, str | None]]:
+    rest = line.strip()[len("CLIP") :].strip()
+    if not rest:
+        return None, {}
+    if "=" not in rest:
+        return rest, {}
+    try:
+        tokens = shlex.split(rest)
+    except ValueError as exc:
+        raise ValueError(f"Invalid CLIP header on line {line_no}: {exc}") from exc
+    tag_parts: list[str] = []
+    fields: dict[str, str | None] = {}
+    saw_key = False
+    for token in tokens:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            if not key:
+                raise ValueError(f"Invalid CLIP field on line {line_no}: {token}")
+            field = _CLIP_FIELD_ALIASES.get(key.lower())
+            if field is None:
+                raise ValueError(f"Unknown CLIP field '{key}' on line {line_no}")
+            normalized = value.strip()
+            fields[field] = normalized if normalized else None
+            saw_key = True
+        else:
+            if saw_key:
+                raise ValueError(
+                    f"Unexpected token in CLIP header on line {line_no}: {token}"
+                )
+            tag_parts.append(token)
+    tag = " ".join(tag_parts) if tag_parts else None
+    return tag, fields
+
+
+_CLIP_FIELD_ORDER = [
+    ("label", "label"),
+    ("rotation", "rotation"),
+    ("score", "score"),
+    ("opponent", "opponent"),
+    ("serve_target", "serve_target"),
+]
+
+
+def _format_clip_header(clip: ClipSpec) -> str:
+    parts = ["CLIP"]
+    if clip.tag:
+        parts.append(clip.tag)
+    for key, attr in _CLIP_FIELD_ORDER:
+        value = getattr(clip, attr)
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={_quote_if_needed(str(value))}")
+    return " ".join(parts)
+
+
+def _quote_if_needed(value: str) -> str:
+    if any(ch.isspace() for ch in value) or any(ch in "\"'" for ch in value):
+        return shlex.quote(value)
+    return value

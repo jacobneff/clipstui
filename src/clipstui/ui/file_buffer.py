@@ -136,7 +136,7 @@ class FileBufferTextArea(TextArea):
                 start_col += 1
             if start_col >= len(plain):
                 return
-            text.stylize("on #2b3344", start_col, len(plain))
+            text.stylize("on #2f334d", start_col, len(plain))
             return
 
         anchor_row, anchor_col = self.visual_anchor
@@ -174,7 +174,7 @@ class FileBufferTextArea(TextArea):
         if start_col >= len(plain):
             return
         end_col = max(start_col + 1, min(len(plain), end_col))
-        text.stylize("on #2b3344", start_col, end_col)
+        text.stylize("on #2f334d", start_col, end_col)
 
     def _cursor_display_line(
         self, line_index: int, line_string: str

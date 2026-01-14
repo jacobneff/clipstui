@@ -45,9 +45,15 @@ class DownloadResult:
     error: str | None = None
 
 
-def build_ytdlp_command(clip: ResolvedClip, output_dir: Path, output_format: str) -> list[str]:
+def build_ytdlp_command(
+    clip: ResolvedClip,
+    output_dir: Path,
+    output_format: str,
+    output_name: str | None = None,
+) -> list[str]:
     output_format = output_format.lower().lstrip(".")
-    output_path = output_dir / f"{clip.output_name}.%(ext)s"
+    name = output_name or clip.output_name
+    output_path = output_dir / f"{name}.%(ext)s"
     section = f"*{format_seconds(clip.cut_start)}-{format_seconds(clip.cut_end)}"
     base_url = _strip_time_params(clip.clip.start_url)
     return [
@@ -71,11 +77,13 @@ def run_ytdlp(
     clip: ResolvedClip,
     output_dir: Path,
     output_format: str,
+    *,
+    output_name: str | None = None,
     runner: Runner | None = None,
 ) -> DownloadResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_format = output_format.lower().lstrip(".")
-    command = build_ytdlp_command(clip, output_dir, output_format)
+    command = build_ytdlp_command(clip, output_dir, output_format, output_name)
     runner = runner or _run_subprocess
 
     try:
@@ -87,7 +95,7 @@ def run_ytdlp(
             error="yt-dlp not found on PATH",
         )
 
-    output_path = _expected_output_path(output_dir, clip, output_format)
+    output_path = _expected_output_path(output_dir, clip, output_format, output_name)
     if completed.returncode != 0:
         error = _summarize_error(completed)
         return DownloadResult(
@@ -109,11 +117,13 @@ def run_ytdlp_with_progress(
     output_format: str,
     on_progress: ProgressCallback,
     cancel_event: threading.Event | None = None,
+    *,
+    output_name: str | None = None,
 ) -> DownloadResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_format = output_format.lower().lstrip(".")
-    command = build_ytdlp_command(clip, output_dir, output_format)
-    output_path = _expected_output_path(output_dir, clip, output_format)
+    command = build_ytdlp_command(clip, output_dir, output_format, output_name)
+    output_path = _expected_output_path(output_dir, clip, output_format, output_name)
 
     if cancel_event is not None and cancel_event.is_set():
         return DownloadResult(
@@ -328,9 +338,15 @@ def _clamp_percent(percent: float | None) -> float | None:
     return max(0.0, min(100.0, percent))
 
 
-def _expected_output_path(output_dir: Path, clip: ResolvedClip, output_format: str) -> Path:
+def _expected_output_path(
+    output_dir: Path,
+    clip: ResolvedClip,
+    output_format: str,
+    output_name: str | None = None,
+) -> Path:
     ext = output_format.lower().lstrip(".")
-    return output_dir / f"{clip.output_name}.{ext}"
+    name = output_name or clip.output_name
+    return output_dir / f"{name}.{ext}"
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

@@ -22,9 +22,16 @@ from .file_browser import (
 from ..clip_time import coerce_time_input, looks_like_url, replace_url_time
 from ..file_ops import normalize_drive_path
 from ..parser import ClipSpec
-from ..resolve import ResolvedClip, resolve_clip
+from ..resolve import (
+    DEFAULT_OUTPUT_TEMPLATE,
+    ResolvedClip,
+    format_output_basename,
+    resolve_clip,
+    validate_output_template,
+)
 from ..timeparse import format_seconds, get_seconds_from_url
 from ..clip_utils import MergeSuggestion
+from ..presets import PresetProfile
 
 
 class HelpScreen(ModalScreen[None]):
@@ -229,7 +236,7 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
 
     #clip_hint {
         color: $text-muted;
-        height: 3;
+        height: 8;
     }
     """
 
@@ -255,6 +262,40 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
                 value=self._clip.tag if self._clip and self._clip.tag else "",
                 placeholder="Optional tag",
                 id="clip_tag",
+            )
+            yield Label("Label (optional)")
+            yield Input(
+                value=self._clip.label if self._clip and self._clip.label else "",
+                placeholder="K/B/A/D/S/E or custom",
+                id="clip_label",
+            )
+            yield Label("Rotation (optional)")
+            yield Input(
+                value=self._clip.rotation if self._clip and self._clip.rotation else "",
+                placeholder="e.g. 1, 2, 3",
+                id="clip_rotation",
+            )
+            yield Label("Score (optional)")
+            yield Input(
+                value=self._clip.score if self._clip and self._clip.score else "",
+                placeholder="e.g. 22-20",
+                id="clip_score",
+            )
+            yield Label("Opponent (optional)")
+            yield Input(
+                value=self._clip.opponent if self._clip and self._clip.opponent else "",
+                placeholder="Opponent team",
+                id="clip_opponent",
+            )
+            yield Label("Serve target (optional)")
+            yield Input(
+                value=(
+                    self._clip.serve_target
+                    if self._clip and self._clip.serve_target
+                    else ""
+                ),
+                placeholder="Zone or target",
+                id="clip_serve_target",
             )
             yield Label("Start URL")
             yield Input(
@@ -343,12 +384,22 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
 
     def _build_clip(self) -> tuple[ClipSpec | None, str | None, ResolvedClip | None]:
         tag_input = self.query_one("#clip_tag", Input)
+        label_input = self.query_one("#clip_label", Input)
+        rotation_input = self.query_one("#clip_rotation", Input)
+        score_input = self.query_one("#clip_score", Input)
+        opponent_input = self.query_one("#clip_opponent", Input)
+        serve_target_input = self.query_one("#clip_serve_target", Input)
         start_input = self.query_one("#clip_start", Input)
         end_input = self.query_one("#clip_end", Input)
         pad_before_input = self.query_one("#clip_pad_before", Input)
         pad_after_input = self.query_one("#clip_pad_after", Input)
 
         tag = tag_input.value.strip() or None
+        label = label_input.value.strip() or None
+        rotation = rotation_input.value.strip() or None
+        score = score_input.value.strip() or None
+        opponent = opponent_input.value.strip() or None
+        serve_target = serve_target_input.value.strip() or None
         start_text = start_input.value.strip()
         end_text = end_input.value.strip()
         if not start_text:
@@ -390,6 +441,11 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
             start_url=start_url,
             end_url=end_url,
             tag=tag,
+            label=label,
+            rotation=rotation,
+            score=score,
+            opponent=opponent,
+            serve_target=serve_target,
             pad_before=pad_before,
             pad_after=pad_after,
         )
@@ -440,12 +496,25 @@ def _pad_value(value: int | None) -> str:
 
 
 def _format_clip_hint(resolved: ResolvedClip) -> str:
+    parts = []
+    if resolved.clip.label:
+        parts.append(f"Label: {resolved.clip.label}")
+    if resolved.clip.rotation:
+        parts.append(f"Rotation: {resolved.clip.rotation}")
+    if resolved.clip.score:
+        parts.append(f"Score: {resolved.clip.score}")
+    if resolved.clip.opponent:
+        parts.append(f"Opponent: {resolved.clip.opponent}")
+    if resolved.clip.serve_target:
+        parts.append(f"Serve: {resolved.clip.serve_target}")
+    context = "\n".join(parts)
     return (
         f"Video: {resolved.video_id}\n"
         f"Start: {format_seconds(resolved.start_sec)}s  "
         f"End: {format_seconds(resolved.end_sec)}s  "
         f"Cut: {format_seconds(resolved.cut_start)}-{format_seconds(resolved.cut_end)}\n"
         f"Output: {resolved.output_name}"
+        + (f"\n{context}" if context else "")
     )
 
 
@@ -756,6 +825,363 @@ class OutputFormatScreen(ModalScreen[str | None]):
             error_label.update("Use only letters/numbers, e.g. mp4 or mkv.")
             return
         self.dismiss(value)
+
+
+class OutputTemplateScreen(ModalScreen[str | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    OutputTemplateScreen {
+        align: center middle;
+        background: $surface 80%;
+    }
+
+    #template_dialog {
+        width: 80%;
+        max-width: 120;
+        padding: 1 2;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #template_preview {
+        height: 2;
+        color: $text;
+    }
+
+    #template_hint {
+        color: $text-muted;
+    }
+
+    #template_error {
+        color: $error;
+        height: 1;
+    }
+    """
+
+    def __init__(self, current: str, clip: ResolvedClip | None, title: str | None) -> None:
+        super().__init__()
+        self._current = current
+        self._clip = clip
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="template_dialog"):
+            yield Label("Output template")
+            yield Input(
+                value=self._current,
+                placeholder=DEFAULT_OUTPUT_TEMPLATE,
+                id="template_input",
+            )
+            yield Static("", id="template_preview")
+            yield Static(
+                "Tokens: {tag} {label} {rotation} {score} {opponent} {serve_target} "
+                "{videoid} {start} {end} {title}",
+                id="template_hint",
+            )
+            yield Label("", id="template_error")
+            with Horizontal():
+                yield Button("Set", id="template_set")
+                yield Button("Reset", id="template_reset")
+                yield Button("Cancel", id="template_cancel")
+
+    def on_mount(self) -> None:
+        self._update_preview()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "template_cancel":
+            self.dismiss(None)
+        elif event.button.id == "template_reset":
+            input_widget = self.query_one("#template_input", Input)
+            input_widget.value = DEFAULT_OUTPUT_TEMPLATE
+            self._update_preview()
+        elif event.button.id == "template_set":
+            self._submit()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "template_input":
+            self._update_preview()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "template_input":
+            self._submit()
+
+    def _sample_clip(self) -> ResolvedClip:
+        if self._clip is not None:
+            return self._clip
+        clip = ClipSpec(
+            start_url="https://www.youtube.com/watch?v=abc123&t=10",
+            end_url="https://www.youtube.com/watch?v=abc123&t=20",
+            tag="C001",
+            label="K",
+            rotation="1",
+            score="22-20",
+            opponent="Sample Opponent",
+            serve_target="Zone 1",
+        )
+        return resolve_clip(clip, pad_before=0, pad_after=0)
+
+    def _update_preview(self) -> None:
+        input_widget = self.query_one("#template_input", Input)
+        preview = self.query_one("#template_preview", Static)
+        error_label = self.query_one("#template_error", Label)
+        value = input_widget.value.strip()
+        if not value:
+            preview.update("Preview: --")
+            error_label.update("Template cannot be empty.")
+            return
+        try:
+            validate_output_template(value)
+            sample = self._sample_clip()
+            title = self._title or "Sample Title"
+            output_name = format_output_basename(value, sample, title=title)
+        except ValueError as exc:
+            preview.update("Preview: --")
+            error_label.update(str(exc))
+            return
+        preview.update(f"Preview: {output_name}")
+        error_label.update("")
+
+    def _submit(self) -> None:
+        input_widget = self.query_one("#template_input", Input)
+        error_label = self.query_one("#template_error", Label)
+        value = input_widget.value.strip()
+        try:
+            validate_output_template(value)
+        except ValueError as exc:
+            error_label.update(str(exc))
+            return
+        self.dismiss(value)
+
+
+class PresetListItem(ListItem):
+    def __init__(self, preset: PresetProfile) -> None:
+        self.preset = preset
+        label = Label(f"{preset.name} - {preset.description}")
+        super().__init__(label)
+
+
+class PresetScreen(ModalScreen[PresetProfile | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    PresetScreen {
+        align: center middle;
+        background: $surface 80%;
+    }
+
+    #preset_dialog {
+        width: 80%;
+        max-width: 120;
+        height: 60%;
+        padding: 1 2;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #preset_list {
+        height: 1fr;
+    }
+
+    #preset_details {
+        height: 4;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, presets: list[PresetProfile]) -> None:
+        super().__init__()
+        self._presets = presets
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="preset_dialog"):
+            yield Label("Preset profiles")
+            yield ListView(id="preset_list")
+            yield Static("", id="preset_details")
+            with Horizontal():
+                yield Button("Apply", id="preset_apply")
+                yield Button("Cancel", id="preset_cancel")
+
+    def on_mount(self) -> None:
+        list_view = self.query_one("#preset_list", ListView)
+        list_view.clear()
+        for preset in self._presets:
+            list_view.append(PresetListItem(preset))
+        if self._presets:
+            list_view.index = 0
+            self._update_details(self._presets[0])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "preset_cancel":
+            self.dismiss(None)
+        elif event.button.id == "preset_apply":
+            preset = self._selected_preset()
+            self.dismiss(preset)
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if isinstance(event.item, PresetListItem):
+            self._update_details(event.item.preset)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, PresetListItem):
+            self.dismiss(event.item.preset)
+
+    def _selected_preset(self) -> PresetProfile | None:
+        list_view = self.query_one("#preset_list", ListView)
+        if list_view.index is None:
+            return None
+        items = [child for child in list_view.children if isinstance(child, PresetListItem)]
+        if not items:
+            return None
+        index = max(0, min(list_view.index, len(items) - 1))
+        return items[index].preset
+
+    def _update_details(self, preset: PresetProfile) -> None:
+        details = self.query_one("#preset_details", Static)
+        parts = []
+        if preset.pad_before is not None or preset.pad_after is not None:
+            before = preset.pad_before if preset.pad_before is not None else "-"
+            after = preset.pad_after if preset.pad_after is not None else "-"
+            parts.append(f"Pad: {before}/{after}s")
+        if preset.output_format:
+            parts.append(f"Format: .{preset.output_format}")
+        if preset.output_dir:
+            parts.append(f"Output: {preset.output_dir}")
+        if preset.output_template:
+            parts.append(f"Template: {preset.output_template}")
+        details.update(" | ".join(parts) if parts else "--")
+
+
+@dataclass(frozen=True)
+class CommandAction:
+    action_id: str
+    title: str
+    description: str = ""
+    keywords: str = ""
+
+
+class CommandPaletteItem(ListItem):
+    def __init__(self, action: CommandAction) -> None:
+        self.action = action
+        label = Label(_format_command_label(action))
+        super().__init__(label)
+
+
+class CommandPaletteScreen(ModalScreen[str | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    CommandPaletteScreen {
+        align: center middle;
+        background: $surface 80%;
+    }
+
+    #command_dialog {
+        width: 80%;
+        max-width: 120;
+        height: 60%;
+        padding: 1 2;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #command_list {
+        height: 1fr;
+    }
+
+    #command_status {
+        height: 1;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, actions: list[CommandAction]) -> None:
+        super().__init__()
+        self._actions = actions
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="command_dialog"):
+            yield Label("Command palette")
+            yield Input(
+                placeholder="Type to filter commands",
+                id="command_input",
+            )
+            yield ListView(id="command_list")
+            yield Label("", id="command_status")
+
+    def on_mount(self) -> None:
+        self._apply_filter()
+        self.query_one("#command_input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "command_input":
+            self._apply_filter()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "command_input":
+            action = self._selected_action()
+            if action is None:
+                return
+            self.dismiss(action.action_id)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, CommandPaletteItem):
+            self.dismiss(event.item.action.action_id)
+
+    def _selected_action(self) -> CommandAction | None:
+        list_view = self.query_one("#command_list", ListView)
+        if list_view.index is None:
+            return None
+        items = [child for child in list_view.children if isinstance(child, CommandPaletteItem)]
+        if not items:
+            return None
+        index = max(0, min(list_view.index, len(items) - 1))
+        return items[index].action
+
+    def _apply_filter(self) -> None:
+        input_widget = self.query_one("#command_input", Input)
+        list_view = self.query_one("#command_list", ListView)
+        status = self.query_one("#command_status", Label)
+        query = input_widget.value.strip().lower()
+        scored: list[tuple[int, CommandAction]] = []
+        if query:
+            for action in self._actions:
+                haystack = _command_search_text(action)
+                score = _fuzzy_score(haystack, query)
+                if score is None:
+                    continue
+                scored.append((score, action))
+            scored.sort(key=lambda item: (item[0], item[1].title.lower()))
+            filtered = [action for _, action in scored]
+        else:
+            filtered = list(self._actions)
+        list_view.clear()
+        for action in filtered:
+            list_view.append(CommandPaletteItem(action))
+        if filtered:
+            list_view.index = 0
+            status.update(f"{len(filtered)} actions")
+        else:
+            status.update("No matches")
+
+
+def _format_command_label(action: CommandAction) -> str:
+    if action.description:
+        return f"{action.title} - {action.description}"
+    return action.title
+
+
+def _command_search_text(action: CommandAction) -> str:
+    return f"{action.title} {action.description} {action.keywords}".lower()
 
 
 @dataclass(frozen=True)

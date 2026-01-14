@@ -20,6 +20,7 @@ class DownloadStatus(Enum):
 @dataclass
 class QueueItem:
     resolved: ResolvedClip
+    output_name: str
     status: DownloadStatus = DownloadStatus.QUEUED
     output_path: Path | None = None
     error: str | None = None

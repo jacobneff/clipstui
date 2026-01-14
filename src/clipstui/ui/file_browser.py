@@ -7,10 +7,10 @@ from pathlib import Path
 from rich.text import Text
 from textual.widgets import Label, ListItem
 
-_DIR_TEXT_STYLE = "#9ccfd8"
-_DIR_ICON_STYLE = "#9ccfd8"
-_FILE_TEXT_STYLE = "#e0def4"
-_FILE_ICON_STYLE = "#e0def4"
+_DIR_TEXT_STYLE = "#7dcfff"
+_DIR_ICON_STYLE = "#7dcfff"
+_FILE_TEXT_STYLE = "#c0caf5"
+_FILE_ICON_STYLE = "#a9b1d6"
 _HIDDEN_STYLE = "dim"
 
 _FOLDER_ICON = ""
@@ -23,14 +23,14 @@ _ARCHIVE_ICON = ""
 _PDF_ICON = ""
 _WINDOWS_ICON = ""
 
-_VIDEO_STYLE = "bright_magenta"
-_AUDIO_STYLE = "bright_green"
-_IMAGE_STYLE = "magenta"
-_ARCHIVE_STYLE = "red"
-_DOC_STYLE = "bright_cyan"
-_CODE_STYLE = "cyan"
-_DATA_STYLE = "bright_yellow"
-_EXEC_STYLE = "bright_red"
+_VIDEO_STYLE = "#bb9af7"
+_AUDIO_STYLE = "#9ece6a"
+_IMAGE_STYLE = "#7aa2f7"
+_ARCHIVE_STYLE = "#e0af68"
+_DOC_STYLE = "#7dcfff"
+_CODE_STYLE = "#7aa2f7"
+_DATA_STYLE = "#2ac3de"
+_EXEC_STYLE = "#f7768e"
 
 _ICON_BY_EXT = {
     ".clip": _TEXT_ICON,
