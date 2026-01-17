@@ -65,8 +65,9 @@ from .fileops_plan import (
     strip_delete_marker,
     validate_plan,
 )
+from .config import AppConfig, load_config, save_config
 from .metadata import VideoMetadata, get_metadata
-from .paths import thumbs_cache_dir
+from .paths import config_path, thumbs_cache_dir
 from .parser import ClipSpec, format_clip_file, parse_clip_file
 from .presets import PresetProfile, find_preset, list_presets
 from .resolve import (
@@ -156,6 +157,7 @@ File picker (NORMAL mode)
 j/k  move up/down
 gg/G  top/bottom
 h/l  parent/enter
+-  parent directory
 n/N  next/prev search match
 enter  open directory / file
 dd  delete line (stage delete)
@@ -201,6 +203,33 @@ p  pause/resume selected
 x  cancel selected
 ctrl+up/down  move queue item
 """
+
+
+def _cli_help_text() -> str:
+    config_file = config_path()
+    return (
+        "clipstui - manage and download YouTube volleyball clips in a TUI.\n"
+        "\n"
+        "Usage:\n"
+        "  clipstui [clip_file] [options]\n"
+        "\n"
+        "Clip format:\n"
+        "  CLIP\n"
+        "  <start_url_with_t_or_start>\n"
+        "  <end_url_with_t_or_start>\n"
+        "\n"
+        "Options:\n"
+        "  --output-dir PATH       Output directory for downloads\n"
+        "  --output-format EXT     Output format (mp4, mkv, webm)\n"
+        "  --output-template TEXT  Output filename template\n"
+        "  --preset NAME           Preset profile name\n"
+        "\n"
+        "Config:\n"
+        f"  {config_file}\n"
+        "\n"
+        "In-app help: press ? for keybindings and usage.\n"
+        "Requires: yt-dlp and ffmpeg on PATH.\n"
+    )
 
 LABEL_KEY_MAP = {
     "K": "K",
@@ -719,6 +748,12 @@ class ClipstuiApp(App):
         self._player_command: str | None = None
         self._show_hidden = False
         self._clip_load_generation = 0
+        self._config_ready = False
+        self._config_warnings: list[str] = []
+        config, config_error = load_config()
+        if config_error:
+            self._config_warnings.append(config_error)
+        self._config_warnings.extend(self._apply_config(config))
         if preset is not None:
             self._apply_preset_profile(preset, show_message=False)
         if output_dir is not None:
@@ -734,6 +769,7 @@ class ClipstuiApp(App):
             validate_output_template(output_template)
             self.output_template = output_template
             self._output_template_override = True
+        self._config_ready = True
 
     def compose(self) -> ComposeResult:
         with Vertical(id="root"):
@@ -778,6 +814,9 @@ class ClipstuiApp(App):
         self._thumb_fallback = self.query_one("#thumb_fallback", Static)
         self._update_left_status()
         self._update_clips_label()
+        if self._config_warnings:
+            message = "Config warnings:\n" + "\n".join(self._config_warnings)
+            self._set_preview_message(message)
         if self._file_buffer is not None:
             self._file_buffer.set_root(self._tree_root)
             self._file_buffer.highlight_cursor_line = False
@@ -1032,6 +1071,7 @@ class ClipstuiApp(App):
         state = "on" if self._show_hidden else "off"
         self._set_preview_message(f"Hidden files: {state}")
         self._populate_file_buffer()
+        self._persist_config()
 
     def action_create_entry(self) -> None:
         if not self._file_list_ready():
@@ -1153,6 +1193,7 @@ class ClipstuiApp(App):
         self._set_preview_message(f"Auto-tag prefix by video: {state}")
         if self.clip_path:
             self.load_clip_file(self.clip_path, select_index=self._clip_list_index)
+        self._persist_config()
 
     def action_pad_global(self) -> None:
         self.push_screen(
@@ -1305,6 +1346,7 @@ class ClipstuiApp(App):
             self._pad_after_default = pad_after
         if self.clip_path:
             self.load_clip_file(self.clip_path, select_index=self._clip_list_index)
+        self._persist_config()
 
     def _handle_pad_video(
         self,
@@ -2333,6 +2375,67 @@ class ClipstuiApp(App):
             return
         self._preview_text.update(message)
 
+    def _apply_config(self, config: AppConfig) -> list[str]:
+        warnings: list[str] = []
+        if config.output_dir:
+            output_dir = Path(config.output_dir).expanduser()
+            if output_dir.exists() and output_dir.is_file():
+                warnings.append(f"Config output_dir is a file: {output_dir}")
+            else:
+                self.output_dir = output_dir
+                self._output_dir_override = True
+        if config.output_format:
+            normalized = _normalize_output_format(config.output_format)
+            if _is_valid_output_format(normalized):
+                self.output_format = normalized
+                self._output_format_override = True
+            else:
+                warnings.append(f"Config output_format invalid: {config.output_format}")
+        if config.output_template:
+            try:
+                validate_output_template(config.output_template)
+                self.output_template = config.output_template
+                self._output_template_override = True
+            except ValueError as exc:
+                warnings.append(f"Config output_template invalid: {exc}")
+        if config.pad_before_default is not None:
+            self._pad_before_default = config.pad_before_default
+        if config.pad_after_default is not None:
+            self._pad_after_default = config.pad_after_default
+        if config.tree_root and self.clip_path is None:
+            tree_root = Path(config.tree_root).expanduser()
+            if tree_root.is_file():
+                tree_root = tree_root.parent
+            if tree_root.exists():
+                self._tree_root = tree_root
+            else:
+                warnings.append(f"Config tree_root not found: {tree_root}")
+        if config.show_hidden is not None:
+            self._show_hidden = config.show_hidden
+        if config.auto_tag_prefix is not None:
+            self._auto_tag_prefix_video = config.auto_tag_prefix
+        return warnings
+
+    def _persist_config(self) -> None:
+        if not self._config_ready:
+            return
+        output_dir = None
+        if self._output_dir_override and self.output_dir is not None:
+            output_dir = str(self.output_dir)
+        config = AppConfig(
+            output_dir=output_dir,
+            output_format=self.output_format,
+            output_template=self.output_template,
+            pad_before_default=self._pad_before_default,
+            pad_after_default=self._pad_after_default,
+            tree_root=str(self._tree_root),
+            show_hidden=self._show_hidden,
+            auto_tag_prefix=self._auto_tag_prefix_video,
+        )
+        error = save_config(config)
+        if error:
+            self._set_preview_message(f"Config save failed:\n{error}")
+
     def _update_left_status(self) -> None:
         if self._file_status is None:
             return
@@ -2388,6 +2491,7 @@ class ClipstuiApp(App):
         self._output_dir_override = True
         self._update_left_status()
         self._set_preview_message(f"Output directory set:\n{result}")
+        self._persist_config()
 
     def _handle_output_format(self, result: str | None) -> None:
         if result is None:
@@ -2397,10 +2501,12 @@ class ClipstuiApp(App):
             self._set_preview_message(f"Invalid output format:\n{result}")
             return
         self.output_format = normalized
+        self._output_format_override = True
         self._update_left_status()
         if self._selected is not None:
             self._set_preview(self._selected)
         self._set_preview_message(f"Output format set: .{self.output_format}")
+        self._persist_config()
 
     def _handle_output_template(self, result: str | None) -> None:
         if result is None:
@@ -2411,6 +2517,7 @@ class ClipstuiApp(App):
         if self._selected is not None:
             self._set_preview(self._selected)
         self._set_preview_message("Output template updated.")
+        self._persist_config()
 
     def _handle_command_palette(
         self,
@@ -2640,6 +2747,9 @@ class ClipstuiApp(App):
             buffer.action_cursor_up()
             return True
         if key == "h":
+            self._go_parent_dir()
+            return True
+        if key == "-":
             self._go_parent_dir()
             return True
         if key == "l":
@@ -4095,6 +4205,7 @@ class ClipstuiApp(App):
             if errors:
                 message = f"{message}\n" + "\n".join(errors)
             self._set_preview_message(message)
+        self._persist_config()
 
     def _latest_queue_item_for_clip(self, clip: ResolvedClip) -> QueueItem | None:
         for item in reversed(self._queue_items):
@@ -4388,6 +4499,7 @@ class ClipstuiApp(App):
             self._file_buffer.set_root(target)
         self._update_left_status()
         self._populate_file_buffer(select_mode=select_mode, focus_path=focus_path)
+        self._persist_config()
 
     def _jump_to_path(self, target: Path) -> None:
         if target.is_file():
@@ -5074,11 +5186,20 @@ def _is_valid_output_format(value: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="clipstui")
     parser.add_argument("clip_file", nargs="?", help="Path to clip file")
+    parser.add_argument(
+        "-help",
+        dest="help_extended",
+        action="store_true",
+        help="Show extended help and exit",
+    )
     parser.add_argument("--output-dir", help="Output directory for downloads")
     parser.add_argument("--output-format", help="Output format, e.g. mp4 or mkv")
     parser.add_argument("--output-template", help="Output filename template")
     parser.add_argument("--preset", help="Preset profile name")
     args = parser.parse_args()
+    if args.help_extended:
+        print(_cli_help_text())
+        return
     path = Path(args.clip_file).expanduser() if args.clip_file else None
     output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
     preset = find_preset(args.preset) if args.preset else None
