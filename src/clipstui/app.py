@@ -158,6 +158,8 @@ j/k  move up/down
 gg/G  top/bottom
 h/l  parent/enter
 -  parent directory
+space  toggle folder expand/collapse
++  toggle expand/collapse all
 n/N  next/prev search match
 enter  open directory / file
 dd  delete line (stage delete)
@@ -720,6 +722,7 @@ class ClipstuiApp(App):
         self._file_listing_signature: tuple[object, ...] | None = None
         self._drive_picker_active = False
         self._drive_picker_return_root: Path | None = None
+        self._expanded_dirs: dict[str, Path] = {}
         self._clip_list: ListView | None = None
         self._queue_list: ListView | None = None
         self._preview_text: Static | None = None
@@ -1935,8 +1938,9 @@ class ClipstuiApp(App):
             current_path = self._current_buffer_path()
         elif select_mode in {"up", "path"}:
             current_path = focus_path
+        self._prune_expanded_dirs()
         try:
-            entries = self._list_file_entries()
+            display_entries = self._collect_file_entries(self._tree_root)
         except OSError as exc:
             self._set_preview_message(f"Failed to read directory:\n{exc}")
             return
@@ -1944,25 +1948,29 @@ class ClipstuiApp(App):
         parent_line = _format_parent_line(self._tree_root)
         if parent_line:
             lines.append(parent_line)
-        lines.extend(_format_entry_line(self._tree_root, entry) for entry in entries)
+        lines.extend(
+            _format_entry_line(self._tree_root, entry, depth, expanded)
+            for entry, depth, expanded in display_entries
+        )
         text = "\n".join(lines)
         buffer.text = text
         self._file_buffer_original_text = text
-        self._file_buffer_original_entries = entries
-        self._file_listing_signature = self._signature_for_entries(entries)
+        flat_entries = [entry for entry, _depth, _expanded in display_entries]
+        self._file_buffer_original_entries = flat_entries
+        self._file_listing_signature = self._signature_for_entries(flat_entries)
         self._file_pending = ""
         self._set_file_mode(FileBufferMode.NORMAL)
-        if select_mode == "first" and entries:
-            current_path = entries[0].path
+        if select_mode == "first" and flat_entries:
+            current_path = flat_entries[0].path
         if current_path:
             self._focus_file_buffer_path(current_path)
         elif lines:
             self._set_buffer_cursor_line(0)
         self._set_search_matches(self._last_search_query)
 
-    def _list_file_entries(self) -> list[PathEntry]:
+    def _list_file_entries_in_dir(self, root: Path) -> list[PathEntry]:
         entries: list[PathEntry] = []
-        with os.scandir(self._tree_root) as iterator:
+        with os.scandir(root) as iterator:
             for entry in iterator:
                 if not self._show_hidden and _entry_is_hidden(entry):
                     continue
@@ -1977,6 +1985,21 @@ class ClipstuiApp(App):
         files.sort(key=lambda item: path_sort_key(item.path))
         return directories + files
 
+    def _collect_file_entries(
+        self,
+        root: Path,
+        *,
+        depth: int = 0,
+    ) -> list[tuple[PathEntry, int, bool]]:
+        entries = self._list_file_entries_in_dir(root)
+        display: list[tuple[PathEntry, int, bool]] = []
+        for entry in entries:
+            expanded = entry.is_dir and _path_key(entry.path) in self._expanded_dirs
+            display.append((entry, depth, expanded))
+            if expanded:
+                display.extend(self._collect_file_entries(entry.path, depth=depth + 1))
+        return display
+
     def _list_drive_roots(self) -> list[Path]:
         drives: list[Path] = []
         for letter in ascii_uppercase:
@@ -1989,8 +2012,17 @@ class ClipstuiApp(App):
         return drives
 
     def _signature_for_entries(self, entries: list[PathEntry]) -> tuple[object, ...]:
-        items = tuple((entry.path.name, entry.is_dir) for entry in entries)
-        return ("dir", str(self._tree_root), self._show_hidden, items)
+        root = self._tree_root.resolve()
+        items: list[tuple[str, bool]] = []
+        for entry in entries:
+            try:
+                rel = entry.path.resolve(strict=False).relative_to(root)
+                key = rel.as_posix()
+            except ValueError:
+                key = entry.path.name
+            items.append((key, entry.is_dir))
+        items_tuple = tuple(items)
+        return ("dir", str(self._tree_root), self._show_hidden, items_tuple)
 
     def _signature_for_drives(self, drives: list[Path]) -> tuple[object, ...]:
         items = tuple(str(drive) for drive in drives)
@@ -2061,8 +2093,10 @@ class ClipstuiApp(App):
                 drives = self._list_drive_roots()
                 signature = self._signature_for_drives(drives)
             else:
-                entries = self._list_file_entries()
-                signature = self._signature_for_entries(entries)
+                self._prune_expanded_dirs()
+                display_entries = self._collect_file_entries(self._tree_root)
+                flat_entries = [entry for entry, _depth, _expanded in display_entries]
+                signature = self._signature_for_entries(flat_entries)
         except OSError:
             return
         if signature != self._file_listing_signature:
@@ -2697,6 +2731,9 @@ class ClipstuiApp(App):
     def _selected_file_entry(self) -> PathEntry | None:
         if not self._file_list_ready():
             return None
+        buffer = self._file_buffer
+        if buffer is None:
+            return None
         line = self._current_buffer_line()
         if not line.strip():
             self._set_preview_message("No file selected.")
@@ -2707,7 +2744,8 @@ class ClipstuiApp(App):
         if self._is_parent_line(line):
             self._set_preview_message("Parent entry is not selectable.")
             return None
-        path = self._parse_buffer_path(line)
+        row, _ = buffer.cursor_location
+        path = self._parse_buffer_path(line, line_index=row)
         if path is None:
             self._set_preview_message("Selected entry is invalid.")
             return None
@@ -2715,6 +2753,77 @@ class ClipstuiApp(App):
             self._set_preview_message(f"Entry no longer exists:\n{path}")
             return None
         return PathEntry(path, path.is_dir())
+
+    def _toggle_directory_expansion(self) -> None:
+        if self._drive_picker_active:
+            self._set_preview_message("Cannot expand drives list.")
+            return
+        entry = self._selected_file_entry()
+        if entry is None:
+            return
+        if not entry.is_dir:
+            self._set_preview_message("Selected entry is not a folder.")
+            return
+        key = _path_key(entry.path)
+        if key in self._expanded_dirs:
+            del self._expanded_dirs[key]
+        else:
+            self._expanded_dirs[key] = entry.path
+        self._populate_file_buffer(select_mode="path", focus_path=entry.path)
+
+    def _toggle_all_directory_expansion(self) -> None:
+        if self._drive_picker_active:
+            self._set_preview_message("Cannot expand drives list.")
+            return
+        self._prune_expanded_dirs()
+        all_dirs = self._collect_all_directories(self._tree_root)
+        if not all_dirs:
+            self._set_preview_message("No folders available to expand.")
+            return
+        all_keys = {_path_key(path) for path in all_dirs}
+        expanded_keys = set(self._expanded_dirs.keys())
+        if all_keys.issubset(expanded_keys) and expanded_keys:
+            self._expanded_dirs.clear()
+        else:
+            self._expanded_dirs = {_path_key(path): path for path in all_dirs}
+        self._populate_file_buffer(select_mode="keep")
+
+    def _prune_expanded_dirs(self) -> None:
+        if not self._expanded_dirs:
+            return
+        root = self._tree_root.resolve()
+        for key, path in list(self._expanded_dirs.items()):
+            try:
+                resolved = path.resolve(strict=False)
+            except OSError:
+                del self._expanded_dirs[key]
+                continue
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                del self._expanded_dirs[key]
+                continue
+            try:
+                is_dir = resolved.is_dir()
+            except OSError:
+                is_dir = False
+            if not is_dir:
+                del self._expanded_dirs[key]
+                continue
+            self._expanded_dirs[key] = resolved
+
+    def _collect_all_directories(self, root: Path) -> list[Path]:
+        try:
+            entries = self._list_file_entries_in_dir(root)
+        except OSError:
+            return []
+        directories: list[Path] = []
+        for entry in entries:
+            if not entry.is_dir:
+                continue
+            directories.append(entry.path)
+            directories.extend(self._collect_all_directories(entry.path))
+        return directories
 
     def _handle_file_normal_key(self, key: str) -> bool:
         buffer = self._file_buffer
@@ -2751,6 +2860,12 @@ class ClipstuiApp(App):
             return True
         if key == "-":
             self._go_parent_dir()
+            return True
+        if key == " ":
+            self._toggle_directory_expansion()
+            return True
+        if key == "+":
+            self._toggle_all_directory_expansion()
             return True
         if key == "l":
             self._open_current_buffer_line()
@@ -2957,30 +3072,68 @@ class ClipstuiApp(App):
         text = strip_icon_prefix(text)
         return text.strip()
 
+    def _line_depth_and_remainder(self, line: str) -> tuple[int, str]:
+        text = line.rstrip("\n")
+        if is_delete_marker_line(text):
+            text = strip_delete_marker(text)
+        indent = len(text) - len(text.lstrip(" "))
+        depth = indent // 2
+        remainder = text.lstrip(" ")
+        remainder = strip_icon_prefix(remainder).strip()
+        return depth, remainder
+
+    def _relative_path_for_line(self, line_index: int, lines: list[str]) -> Path | None:
+        stack: list[str] = []
+        for idx, line in enumerate(lines):
+            depth, remainder = self._line_depth_and_remainder(line)
+            if not remainder or remainder == "..":
+                if depth < len(stack):
+                    stack = stack[:depth]
+                if idx == line_index:
+                    return None
+                continue
+            is_dir_hint = remainder.endswith(("/", "\\"))
+            name = remainder.rstrip("/\\")
+            if depth <= len(stack):
+                stack = stack[:depth]
+            rel = Path(*stack, name)
+            if idx == line_index:
+                return rel
+            if is_dir_hint:
+                if len(stack) == depth:
+                    stack.append(name)
+                else:
+                    stack = stack[:depth] + [name]
+        return None
+
     def _is_parent_line(self, line: str) -> bool:
         return self._strip_buffer_line_for_path(line) == ".."
 
-    def _clean_buffer_line_for_plan(self, line: str) -> str:
+    def _clean_buffer_line_for_plan(self, line: str, line_index: int, lines: list[str]) -> str:
         text = line.strip()
         if not text:
             return ""
+        rel = self._relative_path_for_line(line_index, lines)
+        rel_text = rel.as_posix() if rel is not None else ""
         if is_delete_marker_line(text):
-            remainder = strip_delete_marker(text).strip()
-            remainder = strip_icon_prefix(remainder).strip()
-            if not remainder:
+            if not rel_text:
                 return DELETE_MARKER
-            return f"{DELETE_MARKER} {remainder}"
-        return strip_icon_prefix(text)
+            return f"{DELETE_MARKER} {rel_text}"
+        return rel_text
 
     def _current_buffer_path(self) -> Path | None:
         if self._drive_picker_active:
+            return None
+        buffer = self._file_buffer
+        if buffer is None:
             return None
         line = self._current_buffer_line()
         if not line.strip():
             return None
         if is_delete_marker_line(line):
             return None
-        return self._parse_buffer_path(line)
+        row, _ = buffer.cursor_location
+        return self._parse_buffer_path(line, line_index=row)
 
     def _focus_file_buffer_path(self, path: Path) -> None:
         if self._drive_picker_active:
@@ -2988,7 +3141,7 @@ class ClipstuiApp(App):
         lines = self._file_buffer_lines()
         target_key = _path_key(path)
         for idx, line in enumerate(lines):
-            line_path = self._parse_buffer_path(line)
+            line_path = self._parse_buffer_path(line, line_index=idx)
             if line_path is None:
                 continue
             if _path_key(line_path) == target_key:
@@ -3010,18 +3163,22 @@ class ClipstuiApp(App):
                 self._set_buffer_cursor_line(idx, column=0)
                 return
 
-    def _parse_buffer_path(self, line: str) -> Path | None:
-        text = self._strip_buffer_line_for_path(line)
-        if not text:
+    def _parse_buffer_path(self, line: str, *, line_index: int | None = None) -> Path | None:
+        if self._drive_picker_active:
             return None
-        if text == "..":
+        buffer = self._file_buffer
+        if buffer is None:
             return None
-        text = text.rstrip("/\\")
-        if not text:
+        lines = self._file_buffer_lines()
+        if line_index is None:
+            try:
+                line_index = lines.index(line)
+            except ValueError:
+                return None
+        rel = self._relative_path_for_line(line_index, lines)
+        if rel is None:
             return None
-        path = resolve_user_path(self._tree_root, text)
-        if path is None:
-            return None
+        path = self._tree_root / rel
         try:
             resolved = path.resolve(strict=False)
         except OSError:
@@ -3150,9 +3307,10 @@ class ClipstuiApp(App):
         if self._drive_picker_active:
             self._update_mode_status("Select a drive before applying changes.")
             return
+        raw_lines = buffer.text.splitlines()
         lines = [
-            self._clean_buffer_line_for_plan(line)
-            for line in buffer.text.splitlines()
+            self._clean_buffer_line_for_plan(line, index, raw_lines)
+            for index, line in enumerate(raw_lines)
             if not self._is_parent_line(line)
         ]
         plan = compute_plan(self._tree_root, self._file_buffer_original_entries, lines)
@@ -3629,6 +3787,9 @@ class ClipstuiApp(App):
         if self._drive_picker_active:
             self._open_drive_picker_line()
             return
+        buffer = self._file_buffer
+        if buffer is None:
+            return
         line = self._current_buffer_line()
         if not line.strip():
             self._set_preview_message("No entry selected.")
@@ -3639,7 +3800,8 @@ class ClipstuiApp(App):
         if self._is_parent_line(line):
             self._go_parent_dir()
             return
-        path = self._parse_buffer_path(line)
+        row, _ = buffer.cursor_location
+        path = self._parse_buffer_path(line, line_index=row)
         if path is None:
             self._set_preview_message("Selected entry is invalid.")
             return
@@ -4491,6 +4653,8 @@ class ClipstuiApp(App):
         select_mode: str = "keep",
         focus_path: Path | None = None,
     ) -> None:
+        if target != self._tree_root:
+            self._expanded_dirs.clear()
         self._tree_root = target
         self._drive_picker_active = False
         self._drive_picker_return_root = None
@@ -5150,13 +5314,18 @@ def _entry_is_hidden(entry: os.DirEntry) -> bool:
     return bool(attrs & hidden_flag)
 
 
-def _format_entry_line(root: Path, entry: PathEntry) -> str:
-    rel = entry.path.relative_to(root)
-    text = rel.as_posix()
+def _format_entry_line(
+    root: Path,
+    entry: PathEntry,
+    depth: int = 0,
+    expanded: bool = False,
+) -> str:
+    text = entry.path.name
     kind = FileEntryKind.DIR if entry.is_dir else FileEntryKind.FILE
-    icon = file_icon_for_kind(kind, entry.path)
+    icon = file_icon_for_kind(kind, entry.path, expanded=expanded if entry.is_dir else None)
     suffix = "/" if entry.is_dir else ""
-    return f"{icon} {text}{suffix}"
+    indent = "  " * max(0, depth)
+    return f"{indent}{icon} {text}{suffix}"
 
 
 def _format_drive_line(drive: Path) -> str:

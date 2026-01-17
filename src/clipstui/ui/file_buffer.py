@@ -7,7 +7,7 @@ from rich.text import Text
 from textual.widgets import TextArea
 
 from ..file_ops import resolve_user_path
-from ..fileops_plan import DELETE_MARKER, is_delete_marker_line
+from ..fileops_plan import DELETE_MARKER, is_delete_marker_line, strip_delete_marker
 from .file_browser import (
     FileEntryKind,
     file_icon_style_for_kind,
@@ -99,7 +99,7 @@ class FileBufferTextArea(TextArea):
         if path_start is not None:
             path_text = line_string[path_start:path_end].strip()
             if path_text:
-                kind, path = self._resolve_kind(path_text)
+                kind, path = self._resolve_kind_for_line(line_index, path_text)
                 if icon_index is not None:
                     icon_index = shift_start(icon_index)
                     icon_style = file_icon_style_for_kind(kind, path or Path(path_text))
@@ -254,10 +254,13 @@ class FileBufferTextArea(TextArea):
                     marker_end += 1
         path_start = marker_end
         icon_index = None
-        if marker_end + 1 < len(line):
-            if line[marker_end] in _ICON_SET and line[marker_end + 1] == " ":
-                icon_index = marker_end
-                path_start = marker_end + 2
+        indent_end = marker_end
+        while indent_end < len(line) and line[indent_end] == " ":
+            indent_end += 1
+        if indent_end + 1 < len(line):
+            if line[indent_end] in _ICON_SET and line[indent_end + 1] == " ":
+                icon_index = indent_end
+                path_start = indent_end + 2
         path_end = len(line.rstrip())
         if path_end <= path_start:
             return (None, path_end, icon_index)
@@ -282,3 +285,64 @@ class FileBufferTextArea(TextArea):
             is_dir = is_dir_hint
         kind = FileEntryKind.DIR if is_dir else FileEntryKind.FILE
         return (kind, path)
+
+    def _resolve_kind_for_line(
+        self,
+        line_index: int,
+        path_text: str,
+    ) -> tuple[FileEntryKind, Path | None]:
+        if self.root is None:
+            return self._resolve_kind(path_text)
+        rel = self._relative_path_for_line(line_index)
+        if rel is None:
+            return self._resolve_kind(path_text)
+        stripped = path_text.strip()
+        if stripped == "..":
+            return (FileEntryKind.UP, self.root.parent if self.root else None)
+        is_dir_hint = stripped.endswith(("/", "\\"))
+        path = self.root / rel
+        is_dir = False
+        if path.exists():
+            try:
+                is_dir = path.is_dir()
+            except OSError:
+                is_dir = False
+        if not is_dir:
+            is_dir = is_dir_hint
+        kind = FileEntryKind.DIR if is_dir else FileEntryKind.FILE
+        return (kind, path)
+
+    def _relative_path_for_line(self, line_index: int) -> Path | None:
+        stack: list[str] = []
+        for idx in range(self.document.line_count):
+            line = self.document.get_line(idx)
+            depth, remainder = self._line_depth_and_remainder(line)
+            if not remainder or remainder == "..":
+                if depth < len(stack):
+                    stack = stack[:depth]
+                if idx == line_index:
+                    return None
+                continue
+            is_dir_hint = remainder.endswith(("/", "\\"))
+            name = remainder.rstrip("/\\")
+            if depth <= len(stack):
+                stack = stack[:depth]
+            rel = Path(*stack, name)
+            if idx == line_index:
+                return rel
+            if is_dir_hint:
+                if len(stack) == depth:
+                    stack.append(name)
+                else:
+                    stack = stack[:depth] + [name]
+        return None
+
+    def _line_depth_and_remainder(self, line: str) -> tuple[int, str]:
+        text = line.rstrip("\n")
+        if is_delete_marker_line(text):
+            text = strip_delete_marker(text)
+        indent = len(text) - len(text.lstrip(" "))
+        depth = indent // 2
+        remainder = text.lstrip(" ")
+        remainder = strip_icon_prefix(remainder).strip()
+        return depth, remainder

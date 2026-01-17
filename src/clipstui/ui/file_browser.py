@@ -14,6 +14,7 @@ _FILE_ICON_STYLE = "#a9b1d6"
 _HIDDEN_STYLE = "dim"
 
 _FOLDER_ICON = ""
+_FOLDER_OPEN_ICON = ""
 _FILE_ICON = ""
 _TEXT_ICON = ""
 _VIDEO_ICON = ""
@@ -157,8 +158,15 @@ def path_sort_key(path: Path) -> str:
     return path.name.casefold()
 
 
-def file_icon_for_kind(kind: FileEntryKind, path: Path) -> str:
+def file_icon_for_kind(
+    kind: FileEntryKind,
+    path: Path,
+    *,
+    expanded: bool | None = None,
+) -> str:
     if kind in {FileEntryKind.UP, FileEntryKind.DIR}:
+        if expanded:
+            return _FOLDER_OPEN_ICON
         return _FOLDER_ICON
     return _ICON_BY_EXT.get(path.suffix.lower(), _FILE_ICON)
 
@@ -205,6 +213,7 @@ def known_file_icons() -> set[str]:
     icons.update(
         {
             _FOLDER_ICON,
+            _FOLDER_OPEN_ICON,
             _FILE_ICON,
             _TEXT_ICON,
             _VIDEO_ICON,
