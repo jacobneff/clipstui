@@ -28,6 +28,7 @@ _AUDIO_STYLE = "#9ece6a"
 _IMAGE_STYLE = "#7aa2f7"
 _ARCHIVE_STYLE = "#e0af68"
 _DOC_STYLE = "#7dcfff"
+_CLIP_TEXT_STYLE = "#ff9e64"
 _CODE_STYLE = "#7aa2f7"
 _DATA_STYLE = "#2ac3de"
 _EXEC_STYLE = "#f7768e"
@@ -76,7 +77,7 @@ _ICON_BY_EXT = {
 }
 
 _STYLE_BY_EXT = {
-    ".clip": _DOC_STYLE,
+    ".clip": _CLIP_TEXT_STYLE,
     ".txt": _DOC_STYLE,
     ".md": _DOC_STYLE,
     ".rst": _DOC_STYLE,
@@ -142,7 +143,7 @@ def format_file_label(path: Path, kind: FileEntryKind) -> Text:
     icon = file_icon_for_kind(kind, path)
     name = ".." if kind == FileEntryKind.UP else path.name
     icon_style = file_icon_style_for_kind(kind, path)
-    text_style = file_text_style_for_kind(kind)
+    text_style = file_text_style_for_kind(kind, path)
     label = Text()
     label.append(icon, style=icon_style)
     label.append(" ")
@@ -180,9 +181,11 @@ def file_icon_style_for_kind(kind: FileEntryKind, path: Path) -> str:
     return _STYLE_BY_EXT.get(ext, _FILE_ICON_STYLE)
 
 
-def file_text_style_for_kind(kind: FileEntryKind) -> str:
+def file_text_style_for_kind(kind: FileEntryKind, path: Path | None = None) -> str:
     if kind in {FileEntryKind.UP, FileEntryKind.DIR}:
         return _DIR_TEXT_STYLE
+    if path is not None and path.suffix.lower() == ".clip":
+        return _CLIP_TEXT_STYLE
     return _FILE_TEXT_STYLE
 
 

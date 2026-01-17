@@ -43,6 +43,7 @@ def generate_clip_thumbnail(
     start_sec: float,
     cache_dir: Path | None = None,
     runner: Runner | None = None,
+    direct_url: str | None = None,
 ) -> Path:
     if start_sec < 0:
         raise ValueError("Start time must be non-negative")
@@ -52,9 +53,14 @@ def generate_clip_thumbnail(
     if path.exists():
         return path
     runner = runner or _run_subprocess
-    direct_url = _get_direct_video_url(url, runner)
+    direct_url = direct_url or _get_direct_video_url(url, runner)
     _extract_frame(direct_url, start_sec, path, runner)
     return path
+
+
+def get_direct_video_url(url: str, runner: Runner | None = None) -> str:
+    runner = runner or _run_subprocess
+    return _get_direct_video_url(url, runner)
 
 
 def _guess_extension(url: str) -> str:
@@ -137,4 +143,3 @@ def _first_non_empty_line(text: str) -> str | None:
         if line.strip():
             return line.strip()
     return None
-

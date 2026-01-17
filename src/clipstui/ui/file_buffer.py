@@ -104,7 +104,7 @@ class FileBufferTextArea(TextArea):
                     icon_index = shift_start(icon_index)
                     icon_style = file_icon_style_for_kind(kind, path or Path(path_text))
                     text.stylize(icon_style, icon_index, icon_index + 1)
-                text_style = file_text_style_for_kind(kind)
+                text_style = file_text_style_for_kind(kind, path or Path(path_text))
                 if path_start < path_end:
                     text.stylize(text_style, shift_start(path_start), shift_end(path_end))
                 if path is not None and is_hidden(path):

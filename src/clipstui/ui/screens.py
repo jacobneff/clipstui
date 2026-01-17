@@ -8,7 +8,7 @@ from pathlib import Path
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
@@ -46,9 +46,15 @@ class HelpScreen(ModalScreen[None]):
     #help_dialog {
         width: 70%;
         max-width: 80;
+        height: 80%;
+        max-height: 90%;
         padding: 1 2;
         border: heavy $accent;
         background: $panel;
+    }
+
+    #help_scroll {
+        height: 1fr;
     }
 
     #help_text {
@@ -73,8 +79,12 @@ class HelpScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="help_dialog"):
-            yield Static(self._help_text, id="help_text")
+            with VerticalScroll(id="help_scroll"):
+                yield Static(self._help_text, id="help_text", markup=False)
             yield Button("Close", id="help_close")
+
+    def on_mount(self) -> None:
+        self.query_one("#help_scroll", VerticalScroll).focus()
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -224,9 +234,15 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
     #clip_dialog {
         width: 80%;
         max-width: 100;
+        height: 80%;
+        max-height: 90%;
         padding: 1 2;
         border: heavy $accent;
         background: $panel;
+    }
+
+    #clip_scroll {
+        height: 1fr;
     }
 
     #clip_error {
@@ -256,73 +272,74 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="clip_dialog"):
-            yield Label(self._title)
-            yield Label("Tag (optional)")
-            yield Input(
-                value=self._clip.tag if self._clip and self._clip.tag else "",
-                placeholder="Optional tag",
-                id="clip_tag",
-            )
-            yield Label("Label (optional)")
-            yield Input(
-                value=self._clip.label if self._clip and self._clip.label else "",
-                placeholder="K/B/A/D/S/E or custom",
-                id="clip_label",
-            )
-            yield Label("Rotation (optional)")
-            yield Input(
-                value=self._clip.rotation if self._clip and self._clip.rotation else "",
-                placeholder="e.g. 1, 2, 3",
-                id="clip_rotation",
-            )
-            yield Label("Score (optional)")
-            yield Input(
-                value=self._clip.score if self._clip and self._clip.score else "",
-                placeholder="e.g. 22-20",
-                id="clip_score",
-            )
-            yield Label("Opponent (optional)")
-            yield Input(
-                value=self._clip.opponent if self._clip and self._clip.opponent else "",
-                placeholder="Opponent team",
-                id="clip_opponent",
-            )
-            yield Label("Serve target (optional)")
-            yield Input(
-                value=(
-                    self._clip.serve_target
-                    if self._clip and self._clip.serve_target
-                    else ""
-                ),
-                placeholder="Zone or target",
-                id="clip_serve_target",
-            )
-            yield Label("Start URL")
-            yield Input(
-                value=self._clip.start_url if self._clip else "",
-                placeholder="https://www.youtube.com/watch?v=...&t=10",
-                id="clip_start",
-            )
-            yield Label("End URL")
-            yield Input(
-                value=self._clip.end_url if self._clip else "",
-                placeholder="https://www.youtube.com/watch?v=...&t=20",
-                id="clip_end",
-            )
-            yield Label("Pad before (seconds, optional)")
-            yield Input(
-                value=_pad_value(self._clip.pad_before if self._clip else None),
-                placeholder=f"default {self._pad_before_default}",
-                id="clip_pad_before",
-            )
-            yield Label("Pad after (seconds, optional)")
-            yield Input(
-                value=_pad_value(self._clip.pad_after if self._clip else None),
-                placeholder=f"default {self._pad_after_default}",
-                id="clip_pad_after",
-            )
-            yield Label("", id="clip_error")
-            yield Static("", id="clip_hint")
+            with VerticalScroll(id="clip_scroll"):
+                yield Label(self._title)
+                yield Label("Tag (optional)")
+                yield Input(
+                    value=self._clip.tag if self._clip and self._clip.tag else "",
+                    placeholder="Optional tag",
+                    id="clip_tag",
+                )
+                yield Label("Label (optional)")
+                yield Input(
+                    value=self._clip.label if self._clip and self._clip.label else "",
+                    placeholder="K/B/A/D/S/E or custom",
+                    id="clip_label",
+                )
+                yield Label("Rotation (optional)")
+                yield Input(
+                    value=self._clip.rotation if self._clip and self._clip.rotation else "",
+                    placeholder="e.g. 1, 2, 3",
+                    id="clip_rotation",
+                )
+                yield Label("Score (optional)")
+                yield Input(
+                    value=self._clip.score if self._clip and self._clip.score else "",
+                    placeholder="e.g. 22-20",
+                    id="clip_score",
+                )
+                yield Label("Opponent (optional)")
+                yield Input(
+                    value=self._clip.opponent if self._clip and self._clip.opponent else "",
+                    placeholder="Opponent team",
+                    id="clip_opponent",
+                )
+                yield Label("Serve target (optional)")
+                yield Input(
+                    value=(
+                        self._clip.serve_target
+                        if self._clip and self._clip.serve_target
+                        else ""
+                    ),
+                    placeholder="Zone or target",
+                    id="clip_serve_target",
+                )
+                yield Label("Start URL")
+                yield Input(
+                    value=self._clip.start_url if self._clip else "",
+                    placeholder="https://www.youtube.com/watch?v=...&t=10",
+                    id="clip_start",
+                )
+                yield Label("End URL")
+                yield Input(
+                    value=self._clip.end_url if self._clip else "",
+                    placeholder="https://www.youtube.com/watch?v=...&t=20",
+                    id="clip_end",
+                )
+                yield Label("Pad before (seconds, optional)")
+                yield Input(
+                    value=_pad_value(self._clip.pad_before if self._clip else None),
+                    placeholder=f"default {self._pad_before_default}",
+                    id="clip_pad_before",
+                )
+                yield Label("Pad after (seconds, optional)")
+                yield Input(
+                    value=_pad_value(self._clip.pad_after if self._clip else None),
+                    placeholder=f"default {self._pad_after_default}",
+                    id="clip_pad_after",
+                )
+                yield Label("", id="clip_error")
+                yield Static("", id="clip_hint")
             with Horizontal():
                 yield Button("Save", id="clip_save")
                 yield Button("Cancel", id="clip_cancel")
@@ -1064,12 +1081,13 @@ class CommandAction:
     title: str
     description: str = ""
     keywords: str = ""
+    shortcut: str = ""
 
 
 class CommandPaletteItem(ListItem):
     def __init__(self, action: CommandAction) -> None:
         self.action = action
-        label = Label(_format_command_label(action))
+        label = Label(_format_command_label(action), markup=False)
         super().__init__(label)
 
 
@@ -1175,13 +1193,19 @@ class CommandPaletteScreen(ModalScreen[str | None]):
 
 
 def _format_command_label(action: CommandAction) -> str:
-    if action.description:
-        return f"{action.title} - {action.description}"
+    description = action.description
+    if action.shortcut:
+        suffix = f"[{action.shortcut}]"
+        description = f"{description} {suffix}" if description else suffix
+    if description:
+        return f"{action.title} - {description}"
     return action.title
 
 
 def _command_search_text(action: CommandAction) -> str:
-    return f"{action.title} {action.description} {action.keywords}".lower()
+    return (
+        f"{action.title} {action.description} {action.keywords} {action.shortcut}".lower()
+    )
 
 
 @dataclass(frozen=True)
@@ -1360,6 +1384,126 @@ class SearchResultItem(ListItem):
     def __init__(self, path: Path, label: Text) -> None:
         super().__init__(Label(label))
         self.path = path
+
+
+class ClipFilterScreen(ModalScreen[tuple[str, str, bool] | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    ClipFilterScreen {
+        align: center middle;
+        background: $surface 80%;
+    }
+
+    #filter_dialog {
+        width: 80%;
+        max-width: 100;
+        padding: 1 2;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #filter_sort {
+        height: 1;
+        color: $text;
+    }
+
+    #filter_hint {
+        color: $text-muted;
+        height: 2;
+    }
+
+    #filter_error {
+        color: $error;
+        height: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        filter_text: str,
+        sort_modes: list[tuple[str, str]],
+        sort_mode: str,
+        sort_reverse: bool,
+    ) -> None:
+        super().__init__()
+        self._filter_text = filter_text
+        self._sort_modes = sort_modes
+        self._sort_index = self._find_sort_index(sort_mode)
+        self._sort_reverse = sort_reverse
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="filter_dialog"):
+            yield Label("Filter clips")
+            yield Input(
+                value=self._filter_text,
+                placeholder="tag:Finals label:K video:abc123",
+                id="filter_input",
+            )
+            yield Static("", id="filter_sort")
+            yield Static(
+                "Fields: tag: label: video: title: rotation: score: opponent: serve:",
+                id="filter_hint",
+            )
+            yield Label("", id="filter_error")
+            with Horizontal():
+                yield Button("Cycle sort", id="filter_sort_cycle")
+                yield Button("Toggle order", id="filter_sort_order")
+                yield Button("Clear", id="filter_clear")
+                yield Button("Apply", id="filter_apply")
+                yield Button("Cancel", id="filter_cancel")
+
+    def on_mount(self) -> None:
+        self._refresh_sort_label()
+        input_widget = self.query_one("#filter_input", Input)
+        input_widget.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "filter_cancel":
+            self.dismiss(None)
+        elif event.button.id == "filter_apply":
+            self._submit()
+        elif event.button.id == "filter_clear":
+            input_widget = self.query_one("#filter_input", Input)
+            input_widget.value = ""
+            self._filter_text = ""
+        elif event.button.id == "filter_sort_cycle":
+            self._sort_index = (self._sort_index + 1) % len(self._sort_modes)
+            self._refresh_sort_label()
+        elif event.button.id == "filter_sort_order":
+            self._sort_reverse = not self._sort_reverse
+            self._refresh_sort_label()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "filter_input":
+            self._submit()
+
+    def _submit(self) -> None:
+        input_widget = self.query_one("#filter_input", Input)
+        error_label = self.query_one("#filter_error", Label)
+        text = input_widget.value.strip()
+        if text.count(":") > 12:
+            error_label.update("Filter looks too complex; simplify and try again.")
+            return
+        error_label.update("")
+        sort_mode = self._sort_modes[self._sort_index][0]
+        self.dismiss((text, sort_mode, self._sort_reverse))
+
+    def _refresh_sort_label(self) -> None:
+        label = self.query_one("#filter_sort", Static)
+        _key, name = self._sort_modes[self._sort_index]
+        order = "desc" if self._sort_reverse else "asc"
+        label.update(f"Sort: {name} ({order})")
+
+    def _find_sort_index(self, sort_mode: str) -> int:
+        for index, (key, _name) in enumerate(self._sort_modes):
+            if key == sort_mode:
+                return index
+        return 0
 
 
 class CreateEntryScreen(ModalScreen[str | None]):

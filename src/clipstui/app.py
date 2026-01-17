@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import shutil
+import shlex
 import stat
 import subprocess
 import threading
@@ -65,6 +66,7 @@ from .fileops_plan import (
     validate_plan,
 )
 from .metadata import VideoMetadata, get_metadata
+from .paths import thumbs_cache_dir
 from .parser import ClipSpec, format_clip_file, parse_clip_file
 from .presets import PresetProfile, find_preset, list_presets
 from .resolve import (
@@ -81,7 +83,7 @@ from .exports import (
     manifest_to_json,
 )
 from .timeparse import format_seconds
-from .thumbs import download_thumbnail, generate_clip_thumbnail
+from .thumbs import download_thumbnail, generate_clip_thumbnail, get_direct_video_url
 from .ui.edit_buffer import PlanPreviewScreen
 from .ui.file_browser import FileEntryKind, file_icon_for_kind, is_hidden, path_sort_key
 from .ui.file_buffer import FileBufferTextArea, strip_icon_prefix
@@ -91,6 +93,7 @@ from .ui.screens import (
     CreateEntryScreen,
     DeleteEntryScreen,
     HelpScreen,
+    ClipFilterScreen,
     MoveEntryScreen,
     OutputDirScreen,
     OutputFormatScreen,
@@ -107,22 +110,34 @@ from .ui.screens import (
 )
 from .ytdlp_runner import DownloadResult, ProgressUpdate, run_ytdlp_with_progress
 
-DEFAULT_PAD_BEFORE = 0
-DEFAULT_PAD_AFTER = 0
+DEFAULT_PAD_BEFORE = 1
+DEFAULT_PAD_AFTER = 1
 DEFAULT_MERGE_GAP = 1.0
 DEFAULT_OVERLAP_RATIO = 0.8
+SCRUB_STEP_SMALL = 0.1
+SCRUB_STEP_LARGE = 0.5
+SCRUB_THUMB_DEBOUNCE = 0.25
 TIP_TEXT = "Tip: press ? for help (and / to search)"
+CLIP_SORT_MODES = [
+    ("default", "Default"),
+    ("start", "Start time"),
+    ("end", "End time"),
+    ("duration", "Duration"),
+    ("tag", "Tag"),
+    ("label", "Label"),
+]
 HELP_TEXT = """Keyboard shortcuts
 q  quit (global)
 r  reload clip file
 ctrl+p  command palette
+ctrl+f  filter/sort clips
 h  toggle hidden files (when picker not focused)
 m  set output format
 T  set output template
 o  set output directory
 L  load preset profile
 O  open output in player
-Y  open YouTube at clip start
+y/Y  open YouTube at clip start
 E  export manifest (csv/json)
 C  export concat list (ffmpeg)
 B  create rally pack folder
@@ -168,6 +183,10 @@ d/enter  download current clip (or selected clips)
 space  toggle clip selection
 p  paste clip from clipboard
 K/B/A/D/S/E  label selected clips (kill/block/ace/dig/set/error)
+[/]  scrub frame -/+0.1s
+{/}  scrub frame -/+0.5s
+,/.  scrub to start/end
+ctrl+r  refresh scrub frame
 enter/space on group header  expand/collapse group
 e  edit clip
 a  add clip
@@ -337,16 +356,14 @@ class ClipstuiApp(App):
         ("q", "quit", "Quit"),
         ("r", "reload", "Reload"),
         ("ctrl+p", "command_palette", "Command Palette"),
-        ("c", "create_entry", "Create"),
-        ("R", "rename_entry", "Rename"),
-        ("M", "move_entry", "Move"),
-        ("X", "delete_entry", "Delete"),
+        ("ctrl+f", "clip_filter", "Clip Filter"),
         ("h", "toggle_hidden", "Hidden"),
         ("o", "output_dir", "Output Dir"),
         ("m", "output_format", "Output Format"),
         ("T", "output_template", "Output Template"),
         ("L", "preset", "Preset"),
         ("O", "open_in_player", "Open in Player"),
+        ("y", "open_youtube", "Open YouTube"),
         ("Y", "open_youtube", "Open YouTube"),
         ("E", "export_manifest", "Export Manifest"),
         ("C", "export_concat", "Export Concat"),
@@ -645,6 +662,12 @@ class ClipstuiApp(App):
         self._overlap_index: dict[ResolvedClip, list[OverlapFinding]] = {}
         self._merge_suggestions: list[MergeSuggestion] = []
         self._merge_index: dict[ResolvedClip, list[MergeSuggestion]] = {}
+        self._clip_filter_text = ""
+        self._clip_sort_mode = "default"
+        self._clip_sort_reverse = False
+        self._scrub_times: dict[ResolvedClip, float] = {}
+        self._pending_scrub_clip: ResolvedClip | None = None
+        self._scrub_thumb_timer = None
         self._auto_tag_prefix_video = False
         self._pad_before_default = DEFAULT_PAD_BEFORE
         self._pad_after_default = DEFAULT_PAD_AFTER
@@ -653,6 +676,7 @@ class ClipstuiApp(App):
         self._last_search_index = -1
         self._file_status: Label | None = None
         self._vim_status: Label | None = None
+        self._clips_label: Label | None = None
         self._file_buffer: FileBufferTextArea | None = None
         self._file_command: Input | None = None
         self._file_mode = FileBufferMode.NORMAL
@@ -681,6 +705,7 @@ class ClipstuiApp(App):
         self._thumb_errors: dict[tuple[str, str], str] = {}
         self._thumb_loading: set[tuple[str, str]] = set()
         self._thumb_fallback_cache: dict[tuple[str, str], Text] = {}
+        self._direct_url_cache: dict[str, str] = {}
         self._video_thumb_cache: dict[str, Path] = {}
         self._video_thumb_errors: dict[str, str] = {}
         self._video_thumb_loading: set[str] = set()
@@ -743,6 +768,7 @@ class ClipstuiApp(App):
     def on_mount(self) -> None:
         self._file_status = self.query_one("#file_status", Label)
         self._vim_status = self.query_one("#vim_status", Label)
+        self._clips_label = self.query_one("#clips_label", Label)
         self._file_buffer = self.query_one("#file_buffer", FileBufferTextArea)
         self._file_command = self.query_one("#file_command", Input)
         self._clip_list = self.query_one("#clip_list", ListView)
@@ -751,6 +777,7 @@ class ClipstuiApp(App):
         self._thumb_image = self.query_one("#thumb_image", PreviewImage)
         self._thumb_fallback = self.query_one("#thumb_fallback", Static)
         self._update_left_status()
+        self._update_clips_label()
         if self._file_buffer is not None:
             self._file_buffer.set_root(self._tree_root)
             self._file_buffer.highlight_cursor_line = False
@@ -978,6 +1005,27 @@ class ClipstuiApp(App):
             SearchScreen(self._tree_root, self._show_hidden),
             self._handle_search,
         )
+
+    def action_clip_filter(self) -> None:
+        self.push_screen(
+            ClipFilterScreen(
+                filter_text=self._clip_filter_text,
+                sort_modes=CLIP_SORT_MODES,
+                sort_mode=self._clip_sort_mode,
+                sort_reverse=self._clip_sort_reverse,
+            ),
+            self._handle_clip_filter,
+        )
+
+    def action_clear_clip_filter(self) -> None:
+        if not self._clip_filter_text and self._clip_sort_mode == "default" and not self._clip_sort_reverse:
+            self._set_preview_message("Clip filter already clear.")
+            return
+        self._clip_filter_text = ""
+        self._clip_sort_mode = "default"
+        self._clip_sort_reverse = False
+        self._apply_clip_filter_state()
+        self._set_preview_message("Clip filter cleared.")
 
     def action_toggle_hidden(self) -> None:
         self._show_hidden = not self._show_hidden
@@ -1441,6 +1489,11 @@ class ClipstuiApp(App):
         self._clip_selection.clear()
         self._selected = None
         self._selected_group_video_id = None
+        self._scrub_times.clear()
+        self._pending_scrub_clip = None
+        if self._scrub_thumb_timer is not None:
+            self._scrub_thumb_timer.stop()
+            self._scrub_thumb_timer = None
 
     def _write_clip_specs(self, specs: list[ClipSpec], *, select_index: int | None) -> None:
         if self.clip_path is None:
@@ -1468,6 +1521,8 @@ class ClipstuiApp(App):
                 self._queue_list_index = self._queue_list_items().index(event.item)
             except ValueError:
                 self._queue_list_index = 0
+        if self._clip_list is not None and event.list_view == self._clip_list:
+            self._sync_clip_list_highlight()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if isinstance(event.item, ClipListItem):
@@ -1476,6 +1531,9 @@ class ClipstuiApp(App):
     def on_focus(self, event: events.Focus) -> None:
         if event.widget in {self._file_buffer, self._file_command}:
             self._update_mode_status()
+            return
+        if self._clip_list is not None and event.widget == self._clip_list:
+            self.call_later(self._normalize_clip_list_focus)
 
     def on_blur(self, event: events.Blur) -> None:
         if event.widget in {self._file_buffer, self._file_command}:
@@ -1485,14 +1543,23 @@ class ClipstuiApp(App):
         if self._file_command is not None and self._file_command.has_focus:
             if event.key == "escape":
                 self._exit_command_mode()
-                event.stop()
+            event.stop()
             return
         if self._file_buffer is not None and self._file_buffer.has_focus:
+            if event.key == "tab":
+                if self._clip_list is not None:
+                    self._clip_list.focus()
+                    self.call_later(self._normalize_clip_list_focus)
+                    event.stop()
+                return
             if self._file_mode == FileBufferMode.NORMAL:
                 if event.key in {"escape", "ctrl+c"}:
                     self._file_pending = ""
+                    event.stop()
                     return
                 key = event.character or event.key
+                if key in {"\r", "\n"}:
+                    key = "enter"
                 if key == ":" or event.key in {"colon", ":"}:
                     self._enter_command_mode()
                     event.stop()
@@ -1504,6 +1571,7 @@ class ClipstuiApp(App):
                     "q",
                     "r",
                     "ctrl+p",
+                    "ctrl+f",
                     "d",
                     "A",
                     "f",
@@ -1521,10 +1589,6 @@ class ClipstuiApp(App):
                     "E",
                     "C",
                     "B",
-                    "c",
-                    "R",
-                    "M",
-                    "X",
                     "h",
                     "o",
                     "m",
@@ -1533,6 +1597,8 @@ class ClipstuiApp(App):
                 }
                 if key in blocked_keys:
                     event.stop()
+                    return
+                event.stop()
                 return
             if self._file_mode in {FileBufferMode.VISUAL, FileBufferMode.VISUAL_LINE}:
                 if event.key in {"escape", "ctrl+c"}:
@@ -1540,6 +1606,8 @@ class ClipstuiApp(App):
                     event.stop()
                     return
                 key = event.character or event.key
+                if key in {"\r", "\n"}:
+                    key = "enter"
                 if key == ":" or event.key in {"colon", ":"}:
                     self._enter_command_mode()
                     event.stop()
@@ -1551,6 +1619,7 @@ class ClipstuiApp(App):
                     "q",
                     "r",
                     "ctrl+p",
+                    "ctrl+f",
                     "d",
                     "A",
                     "f",
@@ -1568,10 +1637,6 @@ class ClipstuiApp(App):
                     "E",
                     "C",
                     "B",
-                    "c",
-                    "R",
-                    "M",
-                    "X",
                     "h",
                     "o",
                     "m",
@@ -1580,14 +1645,25 @@ class ClipstuiApp(App):
                 }
                 if key in blocked_keys:
                     event.stop()
+                    return
+                event.stop()
                 return
             if self._file_mode == FileBufferMode.INSERT:
                 if event.key == "escape":
                     self._set_file_mode(FileBufferMode.NORMAL)
                     event.stop()
+                    return
+                event.stop()
                 return
         if self._clip_list is not None and self._clip_list.has_focus:
             current_item = self._current_clip_list_widget()
+            key = event.character or event.key
+            if key in {"[", "]", "{", "}", ",", "."} or event.key == "ctrl+r":
+                if isinstance(current_item, ClipListItem):
+                    scrub_key = "ctrl+r" if event.key == "ctrl+r" else key
+                    if self._handle_scrub_key(current_item.resolved, scrub_key):
+                        event.stop()
+                        return
             label = LABEL_KEY_MAP.get(event.key)
             if label is not None:
                 self._apply_label_to_selection(label)
@@ -1778,7 +1854,9 @@ class ClipstuiApp(App):
         self._clip_selection.clear()
         selected_index = result.select_index or 0
         self._clip_list_index = selected_index
+        self._update_clips_label()
         self._render_clip_list(selected_index)
+        self._normalize_clip_list_focus(schedule_preview=False)
 
         if self._clips:
             self._set_preview(self._clips[selected_index])
@@ -2113,6 +2191,7 @@ class ClipstuiApp(App):
         self._selected = clip
         self._selected_group_video_id = None
         self._ensure_metadata(clip)
+        self._ensure_scrub_time(clip)
         queue_item = self._latest_queue_item_for_clip(clip)
         self._refresh_preview_text(clip, queue_item)
         self._refresh_thumbnail(clip)
@@ -2128,6 +2207,106 @@ class ClipstuiApp(App):
         title = _group_title(metadata)
         self._set_preview_message(_format_group_preview(group, title))
         self._show_group_thumbnail(group.video_id)
+
+    def _ensure_scrub_time(self, clip: ResolvedClip) -> None:
+        if clip in self._scrub_times:
+            return
+        self._scrub_times[clip] = self._clamp_scrub_time(clip, clip.start_sec)
+
+    def _clamp_scrub_time(self, clip: ResolvedClip, value: float) -> float:
+        lower = min(clip.cut_start, clip.cut_end)
+        upper = max(clip.cut_start, clip.cut_end)
+        return max(lower, min(upper, round(value, 3)))
+
+    def _set_scrub_time(
+        self,
+        clip: ResolvedClip,
+        value: float,
+        *,
+        force_refresh: bool = False,
+        defer_thumbnail: bool = False,
+    ) -> None:
+        new_value = self._clamp_scrub_time(clip, value)
+        previous = self._scrub_times.get(clip)
+        self._scrub_times[clip] = new_value
+        if self._selected is None or self._selected != clip:
+            self._set_preview(clip)
+            if force_refresh:
+                self._refresh_thumbnail(clip, force=True)
+            return
+        if previous is not None and abs(previous - new_value) <= 0.0005 and not force_refresh:
+            return
+        queue_item = self._latest_queue_item_for_clip(clip)
+        self._refresh_preview_text(clip, queue_item)
+        if force_refresh:
+            self._refresh_thumbnail(clip, force=True)
+            return
+        if defer_thumbnail:
+            key = _thumb_key_for_time(clip.video_id, new_value)
+            if self._thumb_cached_or_on_disk(key):
+                self._refresh_thumbnail(clip)
+            else:
+                self._schedule_scrub_thumbnail(clip)
+            return
+        self._refresh_thumbnail(clip)
+
+    def _adjust_scrub_time(self, clip: ResolvedClip, delta: float) -> None:
+        current = self._scrub_times.get(clip, clip.start_sec)
+        self._set_scrub_time(clip, current + delta, defer_thumbnail=True)
+
+    def _refresh_scrub_frame(self, clip: ResolvedClip) -> None:
+        self._ensure_scrub_time(clip)
+        if self._selected is None or self._selected != clip:
+            self._set_preview(clip)
+        self._refresh_thumbnail(clip, force=True)
+
+    def _schedule_scrub_thumbnail(self, clip: ResolvedClip) -> None:
+        self._pending_scrub_clip = clip
+        if self._scrub_thumb_timer is not None:
+            self._scrub_thumb_timer.stop()
+        self._scrub_thumb_timer = self.set_timer(
+            SCRUB_THUMB_DEBOUNCE, self._apply_scrub_thumbnail
+        )
+
+    def _apply_scrub_thumbnail(self) -> None:
+        self._scrub_thumb_timer = None
+        clip = self._pending_scrub_clip
+        self._pending_scrub_clip = None
+        if clip is None:
+            return
+        if self._selected is None or self._selected != clip:
+            return
+        self._refresh_thumbnail(clip)
+
+    def _thumb_cached_or_on_disk(self, key: tuple[str, str]) -> bool:
+        path = self._thumb_cache.get(key)
+        if path is not None and path.exists():
+            return True
+        path = self._thumb_path_for_key(key)
+        if path.exists():
+            self._thumb_cache[key] = path
+            return True
+        return False
+
+    def _handle_scrub_key(self, clip: ResolvedClip, key: str) -> bool:
+        if key == "ctrl+r":
+            self._refresh_scrub_frame(clip)
+            return True
+        if key in {"[", "]"}:
+            delta = SCRUB_STEP_SMALL if key == "]" else -SCRUB_STEP_SMALL
+            self._adjust_scrub_time(clip, delta)
+            return True
+        if key in {"{", "}"}:
+            delta = SCRUB_STEP_LARGE if key == "}" else -SCRUB_STEP_LARGE
+            self._adjust_scrub_time(clip, delta)
+            return True
+        if key == ",":
+            self._set_scrub_time(clip, clip.start_sec)
+            return True
+        if key == ".":
+            self._set_scrub_time(clip, clip.end_sec)
+            return True
+        return False
 
     def _schedule_preview(self, clip: ResolvedClip) -> None:
         self._pending_preview = clip
@@ -2166,6 +2345,18 @@ class ClipstuiApp(App):
             self._file_status.update(
                 f"Root:\n{self._tree_root}\n\nFile:\n(none)\n\nOutput:\n{output_dir}\n\nFormat:\n.{self.output_format}\n\nTemplate:\n{self.output_template}"
             )
+
+    def _update_clips_label(self) -> None:
+        if self._clips_label is None:
+            return
+        parts = ["Clips"]
+        if self._clip_filter_text:
+            parts.append(f"filter: {_truncate(self._clip_filter_text, 24)}")
+        if self._clip_sort_mode != "default" or self._clip_sort_reverse:
+            sort_label = _clip_sort_label(self._clip_sort_mode)
+            order = "desc" if self._clip_sort_reverse else "asc"
+            parts.append(f"sort: {sort_label} {order}")
+        self._clips_label.update(" | ".join(parts))
 
     def _update_mode_status(self, message: str | None = None) -> None:
         if self._vim_status is None:
@@ -2351,6 +2542,27 @@ class ClipstuiApp(App):
             self.load_clip_file(path)
             return
         self._set_preview_message(f"Found file:\n{path}")
+
+    def _handle_clip_filter(self, result: tuple[str, str, bool] | None) -> None:
+        if result is None:
+            return
+        text, sort_mode, sort_reverse = result
+        self._clip_filter_text = text
+        self._clip_sort_mode = sort_mode
+        self._clip_sort_reverse = sort_reverse
+        self._apply_clip_filter_state()
+
+    def _apply_clip_filter_state(self) -> None:
+        self._update_clips_label()
+        highlight = self._selected
+        self._render_clip_list(highlight_clip=highlight)
+        current = self._current_clip_list_item()
+        if current is not None:
+            self._set_preview(current.resolved)
+            return
+        self._set_preview_message("No clips found.")
+        self._show_thumbnail_message("Thumbnail: --")
+        self._selected = None
 
     def _set_search_matches(self, query: str | None) -> None:
         if not query:
@@ -2877,6 +3089,36 @@ class ClipstuiApp(App):
             return []
         return [child for child in self._clip_list.children if isinstance(child, ClipListItem)]
 
+    def _normalize_clip_list_focus(self, *, schedule_preview: bool = True) -> None:
+        if self._clip_list is None:
+            return
+        items = self._clip_list_items()
+        if not items:
+            return
+        current = self._current_clip_list_widget()
+        if isinstance(current, ClipListItem):
+            return
+        index = max(0, min(self._clip_list_index, len(items) - 1))
+        target = items[index]
+        children = list(self._clip_list.children)
+        self._clip_list.index = None
+        try:
+            self._clip_list.index = children.index(target)
+        except ValueError:
+            self._clip_list.index = children.index(items[0])
+        self._sync_clip_list_highlight()
+        if schedule_preview:
+            self._schedule_preview(target.resolved)
+
+    def _sync_clip_list_highlight(self) -> None:
+        list_view = self._clip_list
+        if list_view is None:
+            return
+        current = list_view.highlighted_child
+        for child in list_view.children:
+            if isinstance(child, ListItem):
+                child.highlighted = child is current
+
     def _current_clip_list_widget(self) -> ListItem | None:
         if self._clip_list is None:
             return None
@@ -2901,6 +3143,41 @@ class ClipstuiApp(App):
         index = max(0, min(self._clip_list_index, len(items) - 1))
         return items[index]
 
+    def _filtered_clip_groups(self) -> list[ClipGroup]:
+        if not self._clip_groups:
+            return []
+        tokens = _parse_clip_filter(self._clip_filter_text)
+        groups: list[ClipGroup] = []
+        for group in self._clip_groups:
+            metadata = self._metadata_cache.get(group.video_id)
+            title = metadata.title if metadata and metadata.title else None
+            clips = group.clips
+            if tokens:
+                clips = [
+                    clip for clip in clips if _clip_matches_filter(clip, tokens, title)
+                ]
+            if not clips:
+                continue
+            sorted_clips = self._sorted_clips(clips)
+            total_duration = sum(_clip_duration(clip) for clip in sorted_clips)
+            groups.append(
+                ClipGroup(
+                    video_id=group.video_id,
+                    clips=sorted_clips,
+                    total_duration=total_duration,
+                )
+            )
+        return groups
+
+    def _sorted_clips(self, clips: list[ResolvedClip]) -> list[ResolvedClip]:
+        mode = self._clip_sort_mode
+        if mode == "default":
+            return list(clips)
+        key_func = _clip_sort_key(mode)
+        if key_func is None:
+            return list(clips)
+        return sorted(clips, key=key_func, reverse=self._clip_sort_reverse)
+
     def _render_clip_list(
         self,
         selected_index: int | None = None,
@@ -2917,7 +3194,7 @@ class ClipstuiApp(App):
             self._collapsed_groups.discard(highlight_clip.video_id)
         items: list[ListItem] = []
         highlight_index: int | None = None
-        for group in self._clip_groups:
+        for group in self._filtered_clip_groups():
             collapsed = group.video_id in self._collapsed_groups
             metadata = self._metadata_cache.get(group.video_id)
             title = _group_title(metadata)
@@ -3424,6 +3701,7 @@ class ClipstuiApp(App):
                     "Download selected clips",
                     "Queue selected or current clip",
                     "download queue",
+                    shortcut="d/enter (clips)",
                 ),
                 self.action_download,
             ),
@@ -3451,6 +3729,7 @@ class ClipstuiApp(App):
                     "Retry failed downloads",
                     "Restart failed queue items",
                     "retry failed",
+                    shortcut="f",
                 ),
                 self.action_retry_failed,
             ),
@@ -3460,6 +3739,7 @@ class ClipstuiApp(App):
                     "Retry failed for current video",
                     "Restart failed for current video",
                     "retry failed",
+                    shortcut="F",
                 ),
                 self.action_retry_failed_video,
             ),
@@ -3469,6 +3749,7 @@ class ClipstuiApp(App):
                     "Open output in player",
                     "Open downloaded clip via mpv/vlc",
                     "player mpv vlc",
+                    shortcut="O",
                 ),
                 self.action_open_in_player,
             ),
@@ -3478,6 +3759,7 @@ class ClipstuiApp(App):
                     "Open YouTube at clip start",
                     "Open in browser",
                     "youtube browser",
+                    shortcut="y/Y",
                 ),
                 self.action_open_youtube,
             ),
@@ -3487,6 +3769,7 @@ class ClipstuiApp(App):
                     "Export manifest (CSV/JSON)",
                     "Write clip list to output dir",
                     "export manifest csv json",
+                    shortcut="E",
                 ),
                 self.action_export_manifest,
             ),
@@ -3496,6 +3779,7 @@ class ClipstuiApp(App):
                     "Export concat list",
                     "ffmpeg concat file in output dir",
                     "concat ffmpeg",
+                    shortcut="C",
                 ),
                 self.action_export_concat,
             ),
@@ -3505,44 +3789,58 @@ class ClipstuiApp(App):
                     "Create rally pack",
                     "Copy outputs + concat list",
                     "rally pack",
+                    shortcut="B",
                 ),
                 self.action_rally_pack,
             ),
             (
                 CommandAction(
-                    "output_dir",
-                    "Set output directory",
-                    "Change download folder",
-                    "output directory",
+                    "add_clip",
+                    "Add clip",
+                    "Append a new clip entry",
+                    "clip add",
+                    shortcut="a (clips)",
                 ),
-                self.action_output_dir,
+                self.action_add_clip,
             ),
             (
                 CommandAction(
-                    "output_format",
-                    "Set output format",
-                    "mp4/mkv/webm",
-                    "output format",
+                    "edit_clip",
+                    "Edit clip",
+                    "Edit the selected clip",
+                    "clip edit",
+                    shortcut="e (clips)",
                 ),
-                self.action_output_format,
+                self.action_edit_clip,
             ),
             (
                 CommandAction(
-                    "output_template",
-                    "Set output template",
-                    "Customize filenames",
-                    "output template",
+                    "clipboard_ingest",
+                    "Paste clip from clipboard",
+                    "Use clipboard URLs to add clip",
+                    "clipboard paste",
+                    shortcut="p (clips)",
                 ),
-                self.action_output_template,
+                self.action_clipboard_ingest,
             ),
             (
                 CommandAction(
-                    "preset",
-                    "Load preset profile",
-                    "Apply pad/format/template defaults",
-                    "preset profile",
+                    "clip_filter",
+                    "Filter/sort clips",
+                    "Filter the clip list",
+                    "filter sort clips",
+                    shortcut="ctrl+f",
                 ),
-                self.action_preset,
+                self.action_clip_filter,
+            ),
+            (
+                CommandAction(
+                    "clip_filter_clear",
+                    "Clear clip filter",
+                    "Reset clip filters and sorting",
+                    "filter clear sort",
+                ),
+                self.action_clear_clip_filter,
             ),
             (
                 CommandAction(
@@ -3550,6 +3848,7 @@ class ClipstuiApp(App):
                     "Set global pad",
                     "Defaults for all clips",
                     "pad",
+                    shortcut="P",
                 ),
                 self.action_pad_global,
             ),
@@ -3559,6 +3858,7 @@ class ClipstuiApp(App):
                     "Set pad for current video",
                     "Apply to current video",
                     "pad",
+                    shortcut="V",
                 ),
                 self.action_pad_video,
             ),
@@ -3568,6 +3868,7 @@ class ClipstuiApp(App):
                     "Set pad for selected clips",
                     "Apply to selected clips",
                     "pad",
+                    shortcut="S",
                 ),
                 self.action_pad_selected,
             ),
@@ -3577,6 +3878,7 @@ class ClipstuiApp(App):
                     "Normalize pad overrides",
                     "Clear overrides matching defaults",
                     "pad normalize",
+                    shortcut="N",
                 ),
                 self.action_normalize_pads,
             ),
@@ -3586,6 +3888,7 @@ class ClipstuiApp(App):
                     "Merge adjacent clips",
                     "Merge when close in time",
                     "merge",
+                    shortcut="g",
                 ),
                 self.action_merge_adjacent,
             ),
@@ -3595,8 +3898,68 @@ class ClipstuiApp(App):
                     "Toggle auto-tag prefix",
                     "Prefix tags by video",
                     "tag",
+                    shortcut="t",
                 ),
                 self.action_toggle_tag_prefix,
+            ),
+            (
+                CommandAction(
+                    "output_dir",
+                    "Set output directory",
+                    "Change download folder",
+                    "output directory",
+                    shortcut="o",
+                ),
+                self.action_output_dir,
+            ),
+            (
+                CommandAction(
+                    "output_format",
+                    "Set output format",
+                    "mp4/mkv/webm",
+                    "output format",
+                    shortcut="m",
+                ),
+                self.action_output_format,
+            ),
+            (
+                CommandAction(
+                    "output_template",
+                    "Set output template",
+                    "Customize filenames",
+                    "output template",
+                    shortcut="T",
+                ),
+                self.action_output_template,
+            ),
+            (
+                CommandAction(
+                    "preset",
+                    "Load preset profile",
+                    "Apply pad/format/template defaults",
+                    "preset profile",
+                    shortcut="L",
+                ),
+                self.action_preset,
+            ),
+            (
+                CommandAction(
+                    "toggle_hidden",
+                    "Toggle hidden files",
+                    "Show/hide hidden entries",
+                    "hidden files",
+                    shortcut="h",
+                ),
+                self.action_toggle_hidden,
+            ),
+            (
+                CommandAction(
+                    "tree_root",
+                    "Set browser root",
+                    "Change file browser root",
+                    "file root",
+                ),
+                self.action_tree_root,
             ),
             (
                 CommandAction(
@@ -3604,8 +3967,45 @@ class ClipstuiApp(App):
                     "Search files",
                     "Fuzzy search in file tree",
                     "search files",
+                    shortcut="/",
                 ),
                 self.action_search,
+            ),
+            (
+                CommandAction(
+                    "create_entry",
+                    "Create entry",
+                    "Create file or folder",
+                    "create file folder",
+                ),
+                self.action_create_entry,
+            ),
+            (
+                CommandAction(
+                    "rename_entry",
+                    "Rename entry",
+                    "Rename file or folder",
+                    "rename file folder",
+                ),
+                self.action_rename_entry,
+            ),
+            (
+                CommandAction(
+                    "move_entry",
+                    "Move entry",
+                    "Move file or folder",
+                    "move file folder",
+                ),
+                self.action_move_entry,
+            ),
+            (
+                CommandAction(
+                    "delete_entry",
+                    "Delete entry",
+                    "Delete file or folder",
+                    "delete file folder",
+                ),
+                self.action_delete_entry,
             ),
             (
                 CommandAction(
@@ -3613,6 +4013,7 @@ class ClipstuiApp(App):
                     "Reload clip file",
                     "Re-parse current clip file",
                     "reload",
+                    shortcut="r",
                 ),
                 self.action_reload,
             ),
@@ -3622,6 +4023,7 @@ class ClipstuiApp(App):
                     "Show help",
                     "Open help screen",
                     "help",
+                    shortcut="?",
                 ),
                 self.action_help,
             ),
@@ -3631,6 +4033,7 @@ class ClipstuiApp(App):
                     "Quit",
                     "Exit the application",
                     "quit exit",
+                    shortcut="q",
                 ),
                 self.exit,
             ),
@@ -3708,6 +4111,7 @@ class ClipstuiApp(App):
         merges = self._merge_index.get(clip, [])
         title = metadata.title if metadata and metadata.title else None
         output_name = item.output_name if item else self._output_basename_for_clip(clip, title)
+        scrub_time = self._scrub_times.get(clip, clip.start_sec)
         self._preview_text.update(
             _format_preview(
                 clip,
@@ -3718,6 +4122,7 @@ class ClipstuiApp(App):
                 metadata_error,
                 warnings,
                 merges,
+                scrub_time,
             )
         )
 
@@ -3861,10 +4266,13 @@ class ClipstuiApp(App):
         else:
             self._show_thumbnail_message("Thumbnail: --")
 
-    def _refresh_thumbnail(self, clip: ResolvedClip) -> None:
+    def _refresh_thumbnail(self, clip: ResolvedClip, *, force: bool = False) -> None:
         if self._thumb_image is None or self._thumb_fallback is None:
             return
-        key = _thumb_key(clip)
+        scrub_time = self._scrub_times.get(clip, clip.start_sec)
+        key = _thumb_key_for_time(clip.video_id, scrub_time)
+        if force:
+            self._invalidate_thumbnail_cache(key)
         thumb_error = self._thumb_errors.get(key)
         if thumb_error:
             self._show_thumbnail_message(f"Thumbnail error: {_short_error(thumb_error)}")
@@ -3883,19 +4291,19 @@ class ClipstuiApp(App):
             return
         if key not in self._thumb_loading:
             self._show_thumbnail_message("Thumbnail: generating...")
-            self._ensure_thumbnail(clip)
+            self._ensure_thumbnail(clip, scrub_time)
         else:
             self._show_thumbnail_message("Thumbnail: generating...")
 
-    def _ensure_thumbnail(self, clip: ResolvedClip) -> None:
-        key = _thumb_key(clip)
+    def _ensure_thumbnail(self, clip: ResolvedClip, scrub_time: float) -> None:
+        key = _thumb_key_for_time(clip.video_id, scrub_time)
         if key in self._thumb_cache or key in self._thumb_loading:
             return
         self._thumb_loading.add(key)
         self._ensure_thumb_worker()
         if self._thumb_queue is None:
             return
-        self._thumb_queue.put((key, clip.clip.start_url, clip.video_id, clip.start_sec))
+        self._thumb_queue.put((key, clip.clip.start_url, clip.video_id, scrub_time))
 
     def _ensure_thumb_worker(self) -> None:
         if self._thumb_worker_started:
@@ -3908,12 +4316,32 @@ class ClipstuiApp(App):
         if self._thumb_queue is None:
             return
         while True:
-            key, url, video_id, start_sec = self._thumb_queue.get()
+            key, url, video_id, scrub_time = self._thumb_queue.get()
+            direct_url = self._direct_url_cache.get(video_id)
             try:
-                path = generate_clip_thumbnail(url, video_id, start_sec)
+                if direct_url is None:
+                    direct_url = get_direct_video_url(url)
+                    self._direct_url_cache[video_id] = direct_url
+                path = generate_clip_thumbnail(
+                    url, video_id, scrub_time, direct_url=direct_url
+                )
                 self.call_from_thread(self._apply_thumbnail, key, path, None)
             except Exception as exc:
-                self.call_from_thread(self._apply_thumbnail, key, None, str(exc))
+                if direct_url is not None:
+                    self._direct_url_cache.pop(video_id, None)
+                    try:
+                        direct_url = get_direct_video_url(url)
+                        self._direct_url_cache[video_id] = direct_url
+                        path = generate_clip_thumbnail(
+                            url, video_id, scrub_time, direct_url=direct_url
+                        )
+                        self.call_from_thread(self._apply_thumbnail, key, path, None)
+                    except Exception as retry_exc:
+                        self.call_from_thread(
+                            self._apply_thumbnail, key, None, str(retry_exc)
+                        )
+                else:
+                    self.call_from_thread(self._apply_thumbnail, key, None, str(exc))
             self._thumb_queue.task_done()
 
     def _apply_thumbnail(
@@ -3925,8 +4353,25 @@ class ClipstuiApp(App):
             self._thumb_errors.pop(key, None)
         if error:
             self._thumb_errors[key] = error
-        if self._selected is not None and _thumb_key(self._selected) == key:
-            self._refresh_thumbnail(self._selected)
+        if self._selected is not None:
+            scrub_time = self._scrub_times.get(self._selected, self._selected.start_sec)
+            if _thumb_key_for_time(self._selected.video_id, scrub_time) == key:
+                self._refresh_thumbnail(self._selected)
+
+    def _thumb_path_for_key(self, key: tuple[str, str]) -> Path:
+        video_id, token = key
+        return thumbs_cache_dir() / f"{video_id}_{token}.jpg"
+
+    def _invalidate_thumbnail_cache(self, key: tuple[str, str]) -> None:
+        self._thumb_errors.pop(key, None)
+        self._thumb_fallback_cache.pop(key, None)
+        path = self._thumb_cache.pop(key, None)
+        if path is None:
+            path = self._thumb_path_for_key(key)
+        try:
+            path.unlink()
+        except OSError:
+            return
 
     def _set_tree_root(
         self,
@@ -4122,6 +4567,7 @@ def _format_preview(
     metadata_error: str | None,
     warnings: list[OverlapFinding] | None,
     merges: list[MergeSuggestion] | None,
+    scrub_time: float,
 ) -> str:
     tag = _format_tag_label(clip)
     label_value = _format_preview_value(clip.clip.label)
@@ -4155,6 +4601,7 @@ def _format_preview(
             f"Start: {format_seconds(clip.start_sec)}",
             f"End: {format_seconds(clip.end_sec)}",
             f"Cut: {format_seconds(clip.cut_start)}-{format_seconds(clip.cut_end)}",
+            f"Scrub: {_format_scrub_line(clip, scrub_time)}",
             f"Output: {output_name}",
         ]
     )
@@ -4244,6 +4691,18 @@ def _format_preview_value(value: str | None) -> str:
     return value if value else "--"
 
 
+def _format_scrub_line(clip: ResolvedClip, scrub_time: float) -> str:
+    label = "scrub"
+    if abs(scrub_time - clip.start_sec) <= 0.001:
+        label = "start"
+    elif abs(scrub_time - clip.end_sec) <= 0.001:
+        label = "end"
+    return (
+        f"{label} {format_seconds(scrub_time)} "
+        f"(range {format_seconds(clip.cut_start)}-{format_seconds(clip.cut_end)})"
+    )
+
+
 def _format_duration(duration: int | None) -> str | None:
     if duration is None:
         return None
@@ -4303,8 +4762,97 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(0, limit - 3)] + "..."
 
 
+def _clip_sort_label(mode: str) -> str:
+    for key, label in CLIP_SORT_MODES:
+        if key == mode:
+            return label
+    return "Default"
+
+
+def _clip_sort_key(mode: str):
+    if mode == "start":
+        return lambda clip: clip.start_sec
+    if mode == "end":
+        return lambda clip: clip.end_sec
+    if mode == "duration":
+        return lambda clip: (_clip_duration(clip), clip.start_sec)
+    if mode == "tag":
+        return lambda clip: (_sort_text(_tag_text(clip)), clip.start_sec)
+    if mode == "label":
+        return lambda clip: (_sort_text(clip.clip.label), clip.start_sec)
+    return None
+
+
+def _sort_text(value: str | None) -> str:
+    return (value or "").casefold()
+
+
+def _tag_text(clip: ResolvedClip) -> str:
+    return clip.display_tag or clip.clip.tag or ""
+
+
+def _clip_duration(clip: ResolvedClip) -> float:
+    return max(0.0, clip.end_sec - clip.start_sec)
+
+
+def _parse_clip_filter(text: str) -> list[tuple[str | None, str]]:
+    if not text:
+        return []
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    parsed: list[tuple[str | None, str]] = []
+    for token in tokens:
+        if ":" in token:
+            key, value = token.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip().lower()
+            if value:
+                parsed.append((key, value))
+            continue
+        parsed.append((None, token.lower()))
+    return parsed
+
+
+def _clip_matches_filter(
+    clip: ResolvedClip,
+    tokens: list[tuple[str | None, str]],
+    title: str | None,
+) -> bool:
+    fields = {
+        "tag": _tag_text(clip).lower(),
+        "label": (clip.clip.label or "").lower(),
+        "video": clip.video_id.lower(),
+        "title": (title or "").lower(),
+        "rotation": (clip.clip.rotation or "").lower(),
+        "score": (clip.clip.score or "").lower(),
+        "opponent": (clip.clip.opponent or "").lower(),
+        "serve": (clip.clip.serve_target or "").lower(),
+        "serve_target": (clip.clip.serve_target or "").lower(),
+    }
+    haystack = " ".join(fields.values())
+    for key, value in tokens:
+        if key is None:
+            if value not in haystack:
+                return False
+            continue
+        target = fields.get(key)
+        if target is None:
+            if value not in haystack:
+                return False
+            continue
+        if value not in target:
+            return False
+    return True
+
+
+def _thumb_key_for_time(video_id: str, seconds: float) -> tuple[str, str]:
+    return (video_id, format_seconds(seconds))
+
+
 def _thumb_key(clip: ResolvedClip) -> tuple[str, str]:
-    return (clip.video_id, format_seconds(clip.start_sec))
+    return _thumb_key_for_time(clip.video_id, clip.start_sec)
 
 
 def _index_overlaps(findings: list[OverlapFinding]) -> dict[ResolvedClip, list[OverlapFinding]]:
