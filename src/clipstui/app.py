@@ -20,7 +20,7 @@ from typing import Callable
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
 from textual.widgets import (
     Input,
@@ -551,28 +551,41 @@ class ClipstuiApp(App):
         color: #f0f2ff;
     }
 
+    #thumb_box {
+        height: 14;
+        width: 100%;
+        align: center top;
+    }
 
     #thumb_image {
-        height: 12;
+        height: 14;
         width: auto;
         border: round $secondary;
     }
 
     #thumb_fallback {
-        height: 12;
+        height: 14;
         width: 100%;
         border: round $secondary;
         background: $panel;
-        padding: 0 1;
+        padding: 0 2;
         overflow: hidden;
+        content-align: center middle;
+    }
+
+    #preview_scroll {
+        height: 1fr;
+        border: round $boost;
+        background: $surface;
+    }
+
+    #preview_scroll:focus, #preview_scroll:focus-within {
+        border: round $primary;
     }
 
     #preview_text {
-        height: 1fr;
+        width: 100%;
         padding: 1 1;
-        background: $surface;
-        border: round $boost;
-        overflow-y: auto;
     }
 
     #queue_list {
@@ -741,6 +754,7 @@ class ClipstuiApp(App):
         self._expanded_dirs: dict[str, Path] = {}
         self._clip_list: ListView | None = None
         self._queue_list: ListView | None = None
+        self._preview_scroll: VerticalScroll | None = None
         self._preview_text: Static | None = None
         self._thumb_image: PreviewImage | None = None
         self._thumb_fallback: Static | None = None
@@ -815,9 +829,11 @@ class ClipstuiApp(App):
                     yield Label("Queue", id="queue_label")
                     yield ListView(id="queue_list")
                 with Vertical(id="right"):
-                    yield PreviewImage(None, id="thumb_image")
-                    yield Static("Thumbnail: loading...", id="thumb_fallback", classes="hidden")
-                    yield Static("Select a clip to preview.", id="preview_text")
+                    with Vertical(id="thumb_box"):
+                        yield PreviewImage(None, id="thumb_image")
+                        yield Static("Thumbnail: loading...", id="thumb_fallback", classes="hidden")
+                    with VerticalScroll(id="preview_scroll"):
+                        yield Static("Select a clip to preview.", id="preview_text")
             yield Static(TIP_TEXT, id="tip_bar")
 
     def on_mount(self) -> None:
@@ -828,6 +844,7 @@ class ClipstuiApp(App):
         self._file_command = self.query_one("#file_command", Input)
         self._clip_list = self.query_one("#clip_list", ListView)
         self._queue_list = self.query_one("#queue_list", ListView)
+        self._preview_scroll = self.query_one("#preview_scroll", VerticalScroll)
         self._preview_text = self.query_one("#preview_text", Static)
         self._thumb_image = self.query_one("#thumb_image", PreviewImage)
         self._thumb_fallback = self.query_one("#thumb_fallback", Static)
@@ -839,6 +856,12 @@ class ClipstuiApp(App):
         if self._file_buffer is not None:
             self._file_buffer.set_root(self._tree_root)
             self._file_buffer.highlight_cursor_line = False
+        if self._preview_scroll is not None:
+            self._preview_scroll.can_focus = True
+        if self._thumb_image is not None:
+            self._thumb_image.can_focus = False
+        if self._thumb_fallback is not None:
+            self._thumb_fallback.can_focus = False
         self._set_file_mode(FileBufferMode.NORMAL)
         self.call_later(self._populate_file_buffer)
         self.set_interval(2.0, self._refresh_file_buffer_if_needed)
