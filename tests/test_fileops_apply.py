@@ -31,3 +31,26 @@ def test_apply_plan_swaps_files(tmp_path: Path) -> None:
     assert report.error_count == 0
     assert a_path.read_text() == "B"
     assert b_path.read_text() == "A"
+
+
+def test_apply_plan_deletes_non_empty_directory(tmp_path: Path) -> None:
+    root = tmp_path
+    dir_path = root / "folder"
+    dir_path.mkdir()
+    nested = dir_path / "nested.txt"
+    nested.write_text("hello")
+
+    operations = [Operation(OperationType.DELETE, source=dir_path, is_dir=True)]
+    plan = OperationPlan(
+        root=root,
+        operations=operations,
+        original_entries=[],
+        edited_entries=[],
+        delete_markers=[],
+        parse_errors=[],
+    )
+
+    report = apply_plan(plan)
+
+    assert report.error_count == 0
+    assert not dir_path.exists()

@@ -146,7 +146,7 @@ f  retry failed downloads
 F  retry failed for current video
 t  toggle auto-tag prefix
 P  set global pad defaults
-V  set pad for current video
+V  set pad for current video (clips pane)
 S  set pad for selected clips
 N  normalize pad overrides
 g  merge adjacent clips
@@ -164,7 +164,7 @@ n/N  next/prev search match
 enter  open directory / file
 dd  delete line (stage delete)
 u  undo
-i/a  insert (at/after cursor)
+i/a/I/A  insert (at/after cursor/start/end)
 o/O  new line below/above + insert
 v/V  visual mode (char/line)
 :  command mode (:w, :wq, :q, :q!)
@@ -184,14 +184,14 @@ arrow keys to move between clips
 
 Clip list
 d/enter  download current clip (or selected clips)
-space  toggle clip selection
+space  toggle clip selection / group expand
++  toggle expand/collapse all groups
 p  paste clip from clipboard
 K/B/A/D/S/E  label selected clips (kill/block/ace/dig/set/error)
 [/]  scrub frame -/+0.1s
 {/}  scrub frame -/+0.5s
 ,/.  scrub to start/end
 ctrl+r  refresh scrub frame
-enter/space on group header  expand/collapse group
 e  edit clip
 a  add clip
 
@@ -338,6 +338,23 @@ class ClipGroupItem(ListItem):
         self._label.update(_format_group_label(self.group, self._collapsed, self._title))
 
 
+class ClipListView(ListView):
+    def on_key(self, event: events.Key) -> None:
+        character = event.character or ""
+        if event.key == "space" or character == " ":
+            handler = getattr(self.app, "_handle_clip_list_space", None)
+            if callable(handler):
+                handler()
+            event.stop()
+            return
+        if event.key == "plus" or character == "+":
+            handler = getattr(self.app, "_toggle_all_clip_groups", None)
+            if callable(handler):
+                handler()
+            event.stop()
+            return
+
+
 class QueueListItem(ListItem):
     _STATUS_CLASSES = {
         DownloadStatus.QUEUED: "status-queued",
@@ -403,7 +420,6 @@ class ClipstuiApp(App):
         ("F", "retry_failed_video", "Retry Failed (Video)"),
         ("t", "toggle_tag_prefix", "Tag Prefix"),
         ("P", "pad_global", "Pad Global"),
-        ("V", "pad_video", "Pad Video"),
         ("S", "pad_selected", "Pad Selected"),
         ("N", "normalize_pads", "Normalize Pads"),
         ("g", "merge_adjacent", "Merge Adjacent"),
@@ -463,8 +479,8 @@ class ClipstuiApp(App):
     }
 
     #file_buffer.mode-insert .text-area--cursor {
-        background: transparent;
-        color: $primary;
+        background: #ffffff;
+        color: #000000;
     }
 
     #file_command {
@@ -795,7 +811,7 @@ class ClipstuiApp(App):
                     )
                 with Vertical(id="middle"):
                     yield Label("Clips", id="clips_label")
-                    yield ListView(id="clip_list")
+                    yield ClipListView(id="clip_list")
                     yield Label("Queue", id="queue_label")
                     yield ListView(id="queue_list")
                 with Vertical(id="right"):
@@ -830,6 +846,12 @@ class ClipstuiApp(App):
             self.call_later(self._load_clip_on_startup)
 
     def action_help(self) -> None:
+        if (
+            self._file_buffer is not None
+            and self._file_buffer.has_focus
+            and self._file_mode != FileBufferMode.NORMAL
+        ):
+            return
         self.push_screen(HelpScreen(HELP_TEXT))
 
     def action_output_dir(self) -> None:
@@ -1198,7 +1220,13 @@ class ClipstuiApp(App):
             self.load_clip_file(self.clip_path, select_index=self._clip_list_index)
         self._persist_config()
 
+    def _clip_list_has_focus(self) -> bool:
+        return self._clip_list is not None and self._clip_list.has_focus
+
     def action_pad_global(self) -> None:
+        if not self._clip_list_has_focus():
+            self._set_preview_message("Focus the clip list to set pad defaults.")
+            return
         self.push_screen(
             PadInputScreen(
                 title="Set global pad defaults",
@@ -1209,6 +1237,9 @@ class ClipstuiApp(App):
         )
 
     def action_pad_video(self) -> None:
+        if not self._clip_list_has_focus():
+            self._set_preview_message("Focus the clip list to set pad for a video.")
+            return
         if not self._clips:
             self._set_preview_message("No clips loaded.")
             return
@@ -1227,6 +1258,9 @@ class ClipstuiApp(App):
         )
 
     def action_pad_selected(self) -> None:
+        if not self._clip_list_has_focus():
+            self._set_preview_message("Focus the clip list to set pad for selected clips.")
+            return
         if not self._clips:
             self._set_preview_message("No clips loaded.")
             return
@@ -1241,6 +1275,9 @@ class ClipstuiApp(App):
         )
 
     def action_normalize_pads(self) -> None:
+        if not self._clip_list_has_focus():
+            self._set_preview_message("Focus the clip list to normalize pad overrides.")
+            return
         specs = self._load_clip_specs()
         if specs is None:
             return
@@ -1710,6 +1747,14 @@ class ClipstuiApp(App):
                         event.stop()
                         return
             label = LABEL_KEY_MAP.get(event.key)
+            if key in {"+", "plus"}:
+                self._toggle_all_clip_groups()
+                event.stop()
+                return
+            if key == "V":
+                self.action_pad_video()
+                event.stop()
+                return
             if label is not None:
                 self._apply_label_to_selection(label)
                 event.stop()
@@ -1726,12 +1771,7 @@ class ClipstuiApp(App):
                 event.stop()
                 return
             if event.key in {"space", " "}:
-                if isinstance(current_item, ClipGroupItem):
-                    self._toggle_clip_group(current_item.video_id)
-                else:
-                    item = self._current_clip_list_item()
-                    if item is not None:
-                        self._toggle_clip_selection(item)
+                self._handle_clip_list_space()
                 event.stop()
                 return
             if event.key == "e":
@@ -1791,7 +1831,7 @@ class ClipstuiApp(App):
     def load_clip_file(self, path: Path, *, select_index: int | None = None) -> None:
         self.clip_path = path
         if not self._output_dir_override:
-            self.output_dir = path.parent
+            self.output_dir = path.parent / "clips"
         if self._tree_root != path.parent:
             self._set_tree_root(path.parent)
         self._update_left_status()
@@ -2077,11 +2117,9 @@ class ClipstuiApp(App):
         buffer = self._file_buffer
         if buffer is None:
             return False
-        if not buffer.has_focus and not self._drive_picker_active:
-            return False
         if self._file_buffer_dirty():
             return False
-        if buffer.has_focus and self._file_mode != FileBufferMode.NORMAL:
+        if self._file_mode != FileBufferMode.NORMAL:
             return False
         return True
 
@@ -2891,11 +2929,22 @@ class ClipstuiApp(App):
         if key == "i":
             self._set_file_mode(FileBufferMode.INSERT)
             return True
+        if key == "I":
+            row, _ = buffer.cursor_location
+            buffer.move_cursor((row, 0), record_width=False)
+            self._set_file_mode(FileBufferMode.INSERT)
+            return True
         if key == "a":
             row, col = buffer.cursor_location
             line = self._current_buffer_line()
             target_col = min(col + 1, len(line))
             buffer.move_cursor((row, target_col), record_width=False)
+            self._set_file_mode(FileBufferMode.INSERT)
+            return True
+        if key == "A":
+            row, _ = buffer.cursor_location
+            line = self._current_buffer_line()
+            buffer.move_cursor((row, len(line)), record_width=False)
             self._set_file_mode(FileBufferMode.INSERT)
             return True
         if key == "o":
@@ -2957,10 +3006,6 @@ class ClipstuiApp(App):
         if key == "/":
             self._exit_visual_mode()
             self.action_search()
-            return True
-        if key == "?":
-            self._exit_visual_mode()
-            self.action_help()
             return True
         return False
 
@@ -3036,14 +3081,8 @@ class ClipstuiApp(App):
             return
         start, end = selection
         lines = self._file_buffer_lines()
-        to_delete: list[int] = []
-        skipped_parent = False
-        for idx in range(start, min(end + 1, len(lines))):
-            line = lines[idx]
-            if self._is_parent_line(line):
-                skipped_parent = True
-                continue
-            to_delete.append(idx)
+        indices = list(range(start, min(end + 1, len(lines))))
+        to_delete, skipped_parent = self._collect_delete_indices(indices, lines)
         if not to_delete:
             if skipped_parent:
                 self._update_mode_status("Cannot delete parent entry.")
@@ -3071,6 +3110,41 @@ class ClipstuiApp(App):
             text = strip_delete_marker(text).strip()
         text = strip_icon_prefix(text)
         return text.strip()
+
+    def _line_is_directory(self, line: str) -> bool:
+        _depth, remainder = self._line_depth_and_remainder(line)
+        if not remainder:
+            return False
+        return remainder.endswith(("/", "\\"))
+
+    def _collect_delete_indices(
+        self, indices: list[int], lines: list[str]
+    ) -> tuple[list[int], bool]:
+        to_delete: set[int] = set()
+        skipped_parent = False
+        for idx in sorted(set(indices)):
+            if idx < 0 or idx >= len(lines):
+                continue
+            line = lines[idx]
+            if not line.strip():
+                continue
+            if self._is_parent_line(line):
+                skipped_parent = True
+                continue
+            if idx in to_delete:
+                continue
+            to_delete.add(idx)
+            if not self._line_is_directory(line):
+                continue
+            depth, _remainder = self._line_depth_and_remainder(line)
+            for next_idx in range(idx + 1, len(lines)):
+                next_depth, next_remainder = self._line_depth_and_remainder(lines[next_idx])
+                if not next_remainder:
+                    continue
+                if next_depth <= depth:
+                    break
+                to_delete.add(next_idx)
+        return (sorted(to_delete), skipped_parent)
 
     def _line_depth_and_remainder(self, line: str) -> tuple[int, str]:
         text = line.rstrip("\n")
@@ -3204,7 +3278,13 @@ class ClipstuiApp(App):
             self._update_mode_status("Cannot delete parent entry.")
             return
         row, _ = buffer.cursor_location
-        buffer.delete((row, 0), (row + 1, 0))
+        lines = self._file_buffer_lines()
+        to_delete, _skipped_parent = self._collect_delete_indices([row], lines)
+        if not to_delete:
+            self._update_mode_status("No entry to delete.")
+            return
+        for idx in reversed(to_delete):
+            buffer.delete((idx, 0), (idx + 1, 0))
         if buffer.document.line_count == 0:
             buffer.text = ""
             return
@@ -3411,6 +3491,17 @@ class ClipstuiApp(App):
         index = max(0, min(self._clip_list_index, len(items) - 1))
         return items[index]
 
+    def _handle_clip_list_space(self) -> None:
+        current_item = self._current_clip_list_widget()
+        if isinstance(current_item, ClipGroupItem):
+            self._toggle_clip_group(current_item.video_id)
+            return
+        item = self._current_clip_list_item()
+        if item is None:
+            self._set_preview_message("No clip selected.")
+            return
+        self._toggle_clip_selection(item)
+
     def _filtered_clip_groups(self) -> list[ClipGroup]:
         if not self._clip_groups:
             return []
@@ -3516,9 +3607,31 @@ class ClipstuiApp(App):
             self._collapsed_groups.remove(video_id)
         else:
             self._collapsed_groups.add(video_id)
-        current = self._current_clip_list_item()
-        highlight_clip = current.resolved if current is not None else None
-        self._render_clip_list(highlight_clip=highlight_clip, highlight_video=video_id)
+        current_widget = self._current_clip_list_widget()
+        highlight_video = (
+            current_widget.video_id
+            if isinstance(current_widget, ClipGroupItem)
+            else video_id
+        )
+        self._render_clip_list(highlight_clip=None, highlight_video=highlight_video)
+
+    def _toggle_all_clip_groups(self) -> None:
+        groups = self._filtered_clip_groups()
+        if not groups:
+            self._set_preview_message("No clip groups available.")
+            return
+        video_ids = {group.video_id for group in groups}
+        if video_ids.issubset(self._collapsed_groups) and video_ids:
+            self._collapsed_groups.difference_update(video_ids)
+        else:
+            self._collapsed_groups.update(video_ids)
+        current_widget = self._current_clip_list_widget()
+        highlight_video = None
+        if isinstance(current_widget, ClipGroupItem):
+            highlight_video = current_widget.video_id
+        elif isinstance(current_widget, ClipListItem):
+            highlight_video = current_widget.resolved.video_id
+        self._render_clip_list(highlight_clip=None, highlight_video=highlight_video)
 
     def _refresh_group_label(self, video_id: str) -> None:
         if self._clip_list is None:
@@ -3811,6 +3924,12 @@ class ClipstuiApp(App):
         if path.is_dir():
             self._set_tree_root(path, select_mode="first")
             return
+        if path.suffix.lower() == ".mp4":
+            try:
+                os.startfile(path)
+            except OSError as exc:
+                self._set_preview_message(f"Failed to open video:\n{exc}")
+            return
         if not is_clip_file(path):
             self._set_preview_message(f"Not a clip file:\n{path}")
             return
@@ -3865,8 +3984,8 @@ class ClipstuiApp(App):
         if self.output_dir:
             return self.output_dir
         if self.clip_path:
-            return self.clip_path.parent
-        return Path.cwd()
+            return self.clip_path.parent / "clips"
+        return Path.cwd() / "clips"
 
     def _load_clip_on_startup(self) -> None:
         if self.clip_path and self.clip_path.is_file():

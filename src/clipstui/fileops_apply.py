@@ -106,8 +106,12 @@ def _apply_delete(op: Operation) -> ApplyResult:
         return ApplyResult(op, ApplyStatus.ERROR, "Missing source path.")
     try:
         if op.is_dir:
-            op.source.rmdir()
+            if not op.source.exists():
+                return ApplyResult(op, ApplyStatus.SKIPPED, "Directory not found.")
+            shutil.rmtree(op.source)
         else:
+            if not op.source.exists():
+                return ApplyResult(op, ApplyStatus.SKIPPED, "File not found.")
             op.source.unlink()
     except OSError as exc:
         return ApplyResult(op, ApplyStatus.ERROR, str(exc))

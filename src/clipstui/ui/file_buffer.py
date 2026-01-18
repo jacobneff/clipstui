@@ -87,6 +87,14 @@ class FileBufferTextArea(TextArea):
             return
         super().action_delete_left()
 
+    def action_cursor_right(self, select: bool = False) -> None:
+        if self.visual_range is not None:
+            row, col = self.cursor_location
+            line = self.document.get_line(row)
+            if col >= len(line):
+                return
+        super().action_cursor_right(select=select)
+
     def get_line(self, line_index: int) -> Text:
         line_string = self.document.get_line(line_index)
         display_line, cursor_mark, insert_index = self._cursor_display_line(
@@ -179,49 +187,16 @@ class FileBufferTextArea(TextArea):
     def _cursor_display_line(
         self, line_index: int, line_string: str
     ) -> tuple[str, int | None, int | None]:
-        if self.cursor_mode != "insert":
-            return line_string, None, None
-        if not self.has_focus:
-            return line_string, None, None
-        if not self._cursor_should_draw():
-            return line_string, None, None
-        row, col = self.cursor_location
-        if row != line_index:
-            return line_string, None, None
-        if col < 0:
-            col = 0
-        padded = line_string
-        if col > len(padded):
-            padded = padded + (" " * (col - len(padded)))
-        cursor_mark = "\u20d2"
-        if col >= len(padded):
-            base = padded + " "
-            mark_index = len(base)
-            display = base + cursor_mark
-            return display, mark_index, mark_index
-        mark_index = col + 1
-        display = f"{padded[:mark_index]}{cursor_mark}{padded[mark_index:]}"
-        return display, mark_index, mark_index
+        return line_string, None, None
 
     def _apply_cursor_mark_style(self, text: Text, mark_index: int) -> None:
+        if self.cursor_mode == "insert":
+            return
         if mark_index < 0 or mark_index >= len(text):
             return
         cursor_style = self.get_component_rich_style("text-area--cursor")
         if cursor_style:
             text.stylize(cursor_style, mark_index, mark_index + 1)
-
-    def _cursor_should_draw(self) -> bool:
-        if not self.has_focus:
-            return False
-        if not self.cursor_blink:
-            return True
-        return self._cursor_visible
-
-    @property
-    def _draw_cursor(self) -> bool:
-        if self.cursor_mode == "insert":
-            return False
-        return super()._draw_cursor
 
     def _shift_start_index(self, insert_index: int | None) -> Callable[[int], int]:
         if insert_index is None:
