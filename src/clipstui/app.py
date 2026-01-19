@@ -4931,7 +4931,16 @@ def _format_queue_label(item: QueueItem, selected: bool = False) -> str:
     marker = "(x)" if selected else "( )"
     status = item.status.value.upper()
     filename = _format_output_name(item.output_name, item.output_format)
-    label = f"{marker} {status:11} {filename}"
+
+    clip_name = item.resolved.display_tag or item.resolved.clip.tag
+    if not clip_name and item.resolved.clip.label:
+        clip_name = f"[{item.resolved.clip.label}]"
+
+    name_part = ""
+    if clip_name and clip_name not in filename:
+        name_part = f"{clip_name} | "
+
+    label = f"{marker} {status:11} {name_part}{filename}"
     meta_parts = []
     percent = _format_percent(item.progress)
     if percent:
