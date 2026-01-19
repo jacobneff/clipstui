@@ -123,8 +123,8 @@ class ThumbnailScreen(ModalScreen[None]):
     }
 
     #thumb_full_dialog {
-        width: 100%;
-        height: 100%;
+        width: 95%;
+        height: 95%;
         padding: 1 2;
         border: heavy $accent;
         background: $panel;
