@@ -780,6 +780,7 @@ class ClipstuiApp(App):
         self._thumb_fallback_cache: dict[tuple[str, str], Text] = {}
         self._current_thumb_path: Path | None = None
         self._current_thumb_message: str | None = "Thumbnail: --"
+        self._current_thumb_key: tuple[str, str] | None = None
         self._direct_url_cache: dict[str, str] = {}
         self._video_thumb_cache: dict[str, Path] = {}
         self._video_thumb_errors: dict[str, str] = {}
@@ -886,7 +887,7 @@ class ClipstuiApp(App):
         if (
             self._file_buffer is not None
             and self._file_buffer.has_focus
-            and self._file_mode != FileBufferMode.NORMAL
+            and self._file_mode == FileBufferMode.INSERT
         ):
             return
         self.push_screen(HelpScreen(HELP_TEXT))
@@ -1166,7 +1167,9 @@ class ClipstuiApp(App):
         self.push_screen(DeleteEntryScreen(item.path), self._handle_delete_entry)
 
     def action_retry_failed(self) -> None:
-        retry_items = [item for item in self._queue_items if item.status == DownloadStatus.FAILED]
+        retry_items: list[QueueItem] = [
+            item for item in self._queue_items if item.status == DownloadStatus.FAILED
+        ]
         if not retry_items:
             self._set_preview_message("No failed downloads to retry.")
             return
@@ -2868,9 +2871,6 @@ class ClipstuiApp(App):
         if key == "/":
             self.action_search()
             return True
-        if key == "?":
-            self.action_help()
-            return True
         if key == "n":
             self._jump_search_match(True)
             return True
@@ -3137,7 +3137,7 @@ class ClipstuiApp(App):
     def _is_parent_line(self, line: str) -> bool:
         return self._strip_buffer_line_for_path(line) == ".."
 
-    def _clean_buffer_line_for_plan(self, line: str, line_index: int, lines: list[str]) -> str:
+    def _clean_buffer_line_for_plan(self, line: str, line_index: int, raw_lines: list[str]) -> str:
         text = line.strip()
         if not text:
             return ""
@@ -3881,10 +3881,9 @@ class ClipstuiApp(App):
             self._set_tree_root(path, select_mode="first")
             return
         if path.suffix.lower() == ".mp4":
-            try:
-                os.startfile(path)
-            except OSError as exc:
-                self._set_preview_message(f"Failed to open video:\n{exc}")
+            opened = webbrowser.open(path.as_uri())
+            if not opened:
+                self._set_preview_message("Failed to open video.")
             return
         if not is_clip_file(path):
             self._set_preview_message(f"Not a clip file:\n{path}")
@@ -4628,6 +4627,8 @@ class ClipstuiApp(App):
         if self._thumb_image is None or self._thumb_fallback is None:
             return
         key = _thumb_key(clip)
+        if not force and key == self._current_thumb_key:
+            return
         if force:
             self._invalidate_thumbnail_cache(key)
         thumb_error = self._thumb_errors.get(key)
@@ -4777,6 +4778,7 @@ class ClipstuiApp(App):
             return False
         self._current_thumb_path = path
         self._current_thumb_message = None
+        self._current_thumb_key = key
         self._thumb_image.remove_class("hidden")
         self._thumb_fallback.add_class("hidden")
         return True
@@ -4795,6 +4797,7 @@ class ClipstuiApp(App):
             self._thumb_fallback_cache[key] = cached
         self._current_thumb_path = path
         self._current_thumb_message = None
+        self._current_thumb_key = key
         self._thumb_fallback.update(cached)
         self._thumb_fallback.remove_class("hidden")
         self._thumb_image.add_class("hidden")
@@ -5364,10 +5367,10 @@ def _entry_is_hidden(entry: os.DirEntry) -> bool:
         return True
     try:
         attrs = entry.stat(follow_symlinks=False).st_file_attributes
-    except OSError:
+        hidden_flag = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0)
+        return bool(attrs & hidden_flag)
+    except (OSError, AttributeError):
         return False
-    hidden_flag = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0)
-    return bool(attrs & hidden_flag)
 
 
 def _format_entry_line(
