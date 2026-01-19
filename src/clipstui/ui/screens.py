@@ -131,11 +131,8 @@ class ThumbnailScreen(ModalScreen[None]):
     }
 
     #thumb_full_image {
-        width: auto;
-        height: auto;
-        max-width: 100%;
-        max-height: 100%;
-        aspect-ratio: 16 9;
+        width: 100%;
+        height: 1fr;
     }
 
     #thumb_full_message {

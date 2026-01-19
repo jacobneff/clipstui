@@ -555,11 +555,11 @@ class ClipstuiApp(App):
     #thumb_box {
         height: auto;
         min-height: 10;
+        max-height: 20;
         width: 100%;
         align: center middle;
         border: round $secondary;
         background: $panel;
-        aspect-ratio: 16 9;
     }
 
     #thumb_box:focus-within {
