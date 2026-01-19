@@ -1191,6 +1191,41 @@ class ClipstuiApp(App):
             return
         self._enqueue_clips(self._clips)
 
+    def action_queue_all_toggle(self) -> None:
+        if not self._clips:
+            self._set_preview_message("No clips loaded.")
+            return
+        # Use filtered clips if filter is active
+        groups = self._filtered_clip_groups()
+        if not groups:
+            self._set_preview_message("No clips visible.")
+            return
+        visible_clips = []
+        for group in groups:
+            visible_clips.extend(group.clips)
+        if not visible_clips:
+            return
+
+        all_selected = all(clip in self._clip_selection for clip in visible_clips)
+        if all_selected:
+            # Deselect all
+            for clip in visible_clips:
+                if clip in self._clip_selection:
+                    self._clip_selection.remove(clip)
+                    self._remove_clip_from_queue(clip)
+            self._set_preview_message("Dequeued all visible clips.")
+        else:
+            # Select all (queue remaining)
+            count = 0
+            for clip in visible_clips:
+                if clip not in self._clip_selection:
+                    self._clip_selection.add(clip)
+                    if self._latest_queue_item_for_clip(clip) is None:
+                        self._enqueue_clip(clip)
+                    count += 1
+            self._set_preview_message(f"Queued {count} remaining clips.")
+        self._render_clip_list()
+
     def action_start_queue(self) -> None:
         queued_items = [
             item for item in self._queue_items if item.status == DownloadStatus.QUEUED
@@ -1817,11 +1852,15 @@ class ClipstuiApp(App):
                 if isinstance(current_item, ClipGroupItem):
                     self._toggle_clip_group(current_item.video_id)
                 else:
-                    self._download_selected_clips()
+                    pass  # Enter no longer queues clips
                 event.stop()
                 return
             if event.key == "d":
                 self._download_selected_clips()
+                event.stop()
+                return
+            if event.key == "ctrl+a":
+                self.action_queue_all_toggle()
                 event.stop()
                 return
             if event.key in {"space", " "}:
@@ -3448,13 +3487,37 @@ class ClipstuiApp(App):
     def _handle_clip_list_space(self) -> None:
         current_item = self._current_clip_list_widget()
         if isinstance(current_item, ClipGroupItem):
-            self._toggle_clip_group(current_item.video_id)
+            self._handle_group_space(current_item.video_id)
             return
         item = self._current_clip_list_item()
         if item is None:
             self._set_preview_message("No clip selected.")
             return
         self._toggle_clip_selection(item)
+
+    def _handle_group_space(self, video_id: str) -> None:
+        group = next((g for g in self._clip_groups if g.video_id == video_id), None)
+        if group is None:
+            return
+        clips = group.clips
+        if not clips:
+            return
+        all_selected = all(clip in self._clip_selection for clip in clips)
+        if all_selected:
+            # Deselect all
+            for clip in clips:
+                if clip in self._clip_selection:
+                    self._clip_selection.remove(clip)
+                    self._remove_clip_from_queue(clip)
+        else:
+            # Select all (queue remaining)
+            for clip in clips:
+                if clip not in self._clip_selection:
+                    self._clip_selection.add(clip)
+                    if self._latest_queue_item_for_clip(clip) is None:
+                        self._enqueue_clip(clip)
+        # Refresh UI
+        self._render_clip_list(highlight_video=video_id)
 
     def _filtered_clip_groups(self) -> list[ClipGroup]:
         if not self._clip_groups:
@@ -3621,6 +3684,7 @@ class ClipstuiApp(App):
         if clip in self._clip_selection:
             self._clip_selection.remove(clip)
             item.set_selected(False)
+            self._remove_clip_from_queue(clip)
             return
         self._clip_selection.add(clip)
         item.set_selected(True)
@@ -3804,6 +3868,27 @@ class ClipstuiApp(App):
         for item in items:
             self._cancel_queue_item(item)
 
+    def _remove_clip_from_queue(self, clip: ResolvedClip) -> None:
+        to_remove = [item for item in self._queue_items if item.resolved == clip]
+        if not to_remove:
+            return
+        for item in to_remove:
+            if item.status == DownloadStatus.DOWNLOADING:
+                self._cancel_queue_item(item)
+        if self._queue_list is not None:
+            # We must rebuild the list because queue widgets are tied to items
+            for item in to_remove:
+                if item in self._queue_items:
+                    self._queue_items.remove(item)
+                    self._queue_widgets.pop(id(item), None)
+            self._rebuild_queue_list()
+        else:
+            # Fallback if UI not ready (unlikely)
+            for item in to_remove:
+                if item in self._queue_items:
+                    self._queue_items.remove(item)
+                    self._queue_widgets.pop(id(item), None)
+
     def _download_selected_clips(self) -> None:
         if self._clip_list is None:
             return
@@ -3828,6 +3913,13 @@ class ClipstuiApp(App):
         queue_list = self._queue_list
         if queue_list is None:
             return
+        if clip not in self._clip_selection:
+            self._clip_selection.add(clip)
+            # Find list item if visible and mark selected
+            for child in self._clip_list_items():
+                if child.resolved == clip:
+                    child.set_selected(True)
+                    break
         metadata = self._metadata_cache.get(clip.video_id)
         title = metadata.title if metadata and metadata.title else None
         output_name = self._output_basename_for_clip(clip, title)
