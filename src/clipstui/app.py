@@ -555,11 +555,11 @@ class ClipstuiApp(App):
     #thumb_box {
         height: auto;
         min-height: 10;
-        max-height: 20;
         width: 100%;
         align: center middle;
         border: round $secondary;
         background: $panel;
+        aspect-ratio: 16 9;
     }
 
     #thumb_box:focus-within {
@@ -1705,10 +1705,12 @@ class ClipstuiApp(App):
             self._update_mode_status()
 
     def on_key(self, event: events.Key) -> None:
-        if (
-            (self._thumb_image is not None and self._thumb_image.has_focus)
-            or (self._thumb_fallback is not None and self._thumb_fallback.has_focus)
-        ):
+        try:
+            thumb_box = self.query_one("#thumb_box")
+        except Exception:
+            thumb_box = None
+
+        if thumb_box and (thumb_box.has_focus or thumb_box.has_focus_within):
             if event.key in {"enter", "return"}:
                 self.action_open_thumbnail()
                 event.stop()
@@ -4931,16 +4933,11 @@ def _format_queue_label(item: QueueItem, selected: bool = False) -> str:
     marker = "(x)" if selected else "( )"
     status = item.status.value.upper()
     filename = _format_output_name(item.output_name, item.output_format)
+    # Truncate filename if it's too long (e.g. > 60 chars)
+    if len(filename) > 60:
+        filename = filename[:57] + "..."
 
-    clip_name = item.resolved.display_tag or item.resolved.clip.tag
-    if not clip_name and item.resolved.clip.label:
-        clip_name = f"[{item.resolved.clip.label}]"
-
-    name_part = ""
-    if clip_name and clip_name not in filename:
-        name_part = f"{clip_name} | "
-
-    label = f"{marker} {status:11} {name_part}{filename}"
+    label = f"{marker} {status} | {filename}"
     meta_parts = []
     percent = _format_percent(item.progress)
     if percent:
