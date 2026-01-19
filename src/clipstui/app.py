@@ -3141,7 +3141,7 @@ class ClipstuiApp(App):
         text = line.strip()
         if not text:
             return ""
-        rel = self._relative_path_for_line(line_index, lines)
+        rel = self._relative_path_for_line(line_index, raw_lines)
         rel_text = rel.as_posix() if rel is not None else ""
         if is_delete_marker_line(text):
             if not rel_text:
