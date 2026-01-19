@@ -564,10 +564,14 @@ def _format_clip_hint(resolved: ResolvedClip) -> str:
     if resolved.clip.opponent:
         parts.append(f"Opponent: {resolved.clip.opponent}")
     context = "\n".join(parts)
+
+    def _fmt(val: float) -> str:
+        return f"{int(val // 60)}:{int(val % 60):02}"
+
     return (
         f"Video: {resolved.video_id}\n"
-        f"Start: {format_seconds(resolved.start_sec)}s  "
-        f"End: {format_seconds(resolved.end_sec)}s  "
+        f"Start: {_fmt(resolved.start_sec)}  "
+        f"End: {_fmt(resolved.end_sec)}  "
         f"Cut: {format_seconds(resolved.cut_start)}-{format_seconds(resolved.cut_end)}\n"
         f"Output: {resolved.output_name}"
         + (f"\n{context}" if context else "")

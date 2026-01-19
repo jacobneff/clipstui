@@ -4958,8 +4958,8 @@ def _format_preview(
             f"Score: {score}",
             f"Opponent: {opponent}",
             f"Video ID: {clip.video_id}",
-            f"Start: {format_seconds(clip.start_sec)}",
-            f"End: {format_seconds(clip.end_sec)}",
+            f"Start: {int(clip.start_sec // 60)}:{int(clip.start_sec % 60):02}",
+            f"End: {int(clip.end_sec // 60)}:{int(clip.end_sec % 60):02}",
             f"Cut: {format_seconds(clip.cut_start)}-{format_seconds(clip.cut_end)}",
             f"Output: {output_name}",
         ]
