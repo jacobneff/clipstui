@@ -11,6 +11,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
+from textual_image.widget import Image as PreviewImage
 
 from .file_browser import (
     FileEntryKind,
@@ -89,9 +90,73 @@ class HelpScreen(ModalScreen[None]):
     def action_close(self) -> None:
         self.dismiss(None)
 
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        character = event.character or ""
+        if key == "escape" or key == "?" or character == "?":
+            self.action_close()
+            event.stop()
+            return
+        if key in {
+            "up",
+            "down",
+            "left",
+            "right",
+            "tab",
+            "shift+tab",
+        }:
+            return
+        event.stop()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "help_close":
             self.dismiss(None)
+
+
+class ThumbnailScreen(ModalScreen[None]):
+    BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close"), ("enter", "close", "Close")]
+
+    CSS = """
+    ThumbnailScreen {
+        align: center middle;
+        background: $surface 80%;
+    }
+
+    #thumb_full_dialog {
+        width: 100%;
+        height: 100%;
+        padding: 1 2;
+        border: heavy $accent;
+        background: $panel;
+    }
+
+    #thumb_full_image {
+        width: 100%;
+        height: 1fr;
+    }
+
+    #thumb_full_message {
+        width: 100%;
+        height: 1fr;
+        content-align: center middle;
+        color: $text;
+    }
+    """
+
+    def __init__(self, path: Path | None, message: str | None = None) -> None:
+        super().__init__()
+        self._path = path
+        self._message = message or "Thumbnail unavailable."
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="thumb_full_dialog"):
+            if self._path is not None:
+                yield PreviewImage(self._path, id="thumb_full_image")
+            else:
+                yield Static(self._message, id="thumb_full_message")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class OutputDirScreen(ModalScreen[Path | None]):
@@ -286,12 +351,6 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
                     placeholder="K/B/A/D/S/E or custom",
                     id="clip_label",
                 )
-                yield Label("Rotation (optional)")
-                yield Input(
-                    value=self._clip.rotation if self._clip and self._clip.rotation else "",
-                    placeholder="e.g. 1, 2, 3",
-                    id="clip_rotation",
-                )
                 yield Label("Score (optional)")
                 yield Input(
                     value=self._clip.score if self._clip and self._clip.score else "",
@@ -303,16 +362,6 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
                     value=self._clip.opponent if self._clip and self._clip.opponent else "",
                     placeholder="Opponent team",
                     id="clip_opponent",
-                )
-                yield Label("Serve target (optional)")
-                yield Input(
-                    value=(
-                        self._clip.serve_target
-                        if self._clip and self._clip.serve_target
-                        else ""
-                    ),
-                    placeholder="Zone or target",
-                    id="clip_serve_target",
                 )
                 yield Label("Start URL")
                 yield Input(
@@ -402,10 +451,8 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
     def _build_clip(self) -> tuple[ClipSpec | None, str | None, ResolvedClip | None]:
         tag_input = self.query_one("#clip_tag", Input)
         label_input = self.query_one("#clip_label", Input)
-        rotation_input = self.query_one("#clip_rotation", Input)
         score_input = self.query_one("#clip_score", Input)
         opponent_input = self.query_one("#clip_opponent", Input)
-        serve_target_input = self.query_one("#clip_serve_target", Input)
         start_input = self.query_one("#clip_start", Input)
         end_input = self.query_one("#clip_end", Input)
         pad_before_input = self.query_one("#clip_pad_before", Input)
@@ -413,10 +460,8 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
 
         tag = tag_input.value.strip() or None
         label = label_input.value.strip() or None
-        rotation = rotation_input.value.strip() or None
         score = score_input.value.strip() or None
         opponent = opponent_input.value.strip() or None
-        serve_target = serve_target_input.value.strip() or None
         start_text = start_input.value.strip()
         end_text = end_input.value.strip()
         if not start_text:
@@ -459,10 +504,8 @@ class ClipEditorScreen(ModalScreen[ClipSpec | None]):
             end_url=end_url,
             tag=tag,
             label=label,
-            rotation=rotation,
             score=score,
             opponent=opponent,
-            serve_target=serve_target,
             pad_before=pad_before,
             pad_after=pad_after,
         )
@@ -516,14 +559,10 @@ def _format_clip_hint(resolved: ResolvedClip) -> str:
     parts = []
     if resolved.clip.label:
         parts.append(f"Label: {resolved.clip.label}")
-    if resolved.clip.rotation:
-        parts.append(f"Rotation: {resolved.clip.rotation}")
     if resolved.clip.score:
         parts.append(f"Score: {resolved.clip.score}")
     if resolved.clip.opponent:
         parts.append(f"Opponent: {resolved.clip.opponent}")
-    if resolved.clip.serve_target:
-        parts.append(f"Serve: {resolved.clip.serve_target}")
     context = "\n".join(parts)
     return (
         f"Video: {resolved.video_id}\n"
@@ -892,7 +931,7 @@ class OutputTemplateScreen(ModalScreen[str | None]):
             )
             yield Static("", id="template_preview")
             yield Static(
-                "Tokens: {tag} {label} {rotation} {score} {opponent} {serve_target} "
+                "Tokens: {tag} {label} {score} {opponent} "
                 "{videoid} {start} {end} {title}",
                 id="template_hint",
             )
@@ -934,10 +973,8 @@ class OutputTemplateScreen(ModalScreen[str | None]):
             end_url="https://www.youtube.com/watch?v=abc123&t=20",
             tag="C001",
             label="K",
-            rotation="1",
             score="22-20",
             opponent="Sample Opponent",
-            serve_target="Zone 1",
         )
         return resolve_clip(clip, pad_before=0, pad_after=0)
 
@@ -1443,7 +1480,7 @@ class ClipFilterScreen(ModalScreen[tuple[str, str, bool] | None]):
             )
             yield Static("", id="filter_sort")
             yield Static(
-                "Fields: tag: label: video: title: rotation: score: opponent: serve:",
+                "Fields: tag: label: video: title: score: opponent:",
                 id="filter_hint",
             )
             yield Label("", id="filter_error")

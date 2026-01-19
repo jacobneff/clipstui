@@ -71,10 +71,8 @@ def test_manifest_entries_include_context_fields(tmp_path: Path) -> None:
         end_url="https://www.youtube.com/watch?v=abc123&t=20",
         tag="C001",
         label="K",
-        rotation="1",
         score="22-20",
         opponent="Old Dominion",
-        serve_target="Zone 1",
     )
     resolved = resolve_clip(clip, pad_before=0, pad_after=0)
     entries = build_manifest_entries(
@@ -86,10 +84,8 @@ def test_manifest_entries_include_context_fields(tmp_path: Path) -> None:
     )
     entry = entries[0]
     assert entry.label == "K"
-    assert entry.rotation == "1"
     assert entry.score == "22-20"
     assert entry.opponent == "Old Dominion"
-    assert entry.serve_target == "Zone 1"
 
 
 def test_manifest_to_csv() -> None:

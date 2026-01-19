@@ -59,8 +59,8 @@ The MVP flow is:
 1. Provide a `.txt` clip file or pick one from the left file tree.
 2. The middle pane lists clips (tag + video id + start/end).
 3. Select a clip to see the details in the right pane (start/end, padded range, output name).
-4. Press `d` to download the selected clip (output defaults to the clip file directory).
-5. Use the queue list to monitor progress and retry failures.
+4. Press `d` to queue the selected clip for download (output defaults to the clip file directory).
+5. Use the queue list to start downloads, monitor progress, and retry failures.
 
 Export helpers:
 
@@ -73,8 +73,8 @@ Keybinds:
 - `q`: quit (global)
 - `r`: reload the current file
 - `ctrl+p`: command palette
-- `d`: download selected clip
-- `A`: download all clips
+- `d`: queue selected clip
+- `A`: queue all clips
 - `f`: retry failed downloads
 - `F`: retry failed downloads for current video
 - `O`: open output in player (mpv/vlc)
@@ -88,6 +88,7 @@ Keybinds:
 - `S`: set pad for selected clips
 - `N`: normalize pad overrides
 - `g`: merge adjacent clips
+- `d`: start queued downloads (queue list)
 - `p`: pause/resume selected queue items (queue list)
 - `p`: paste clip from clipboard (clip list)
 - `D`: download only failed (clip list)
@@ -125,8 +126,8 @@ Vim mode (file picker):
 Clip list:
 
 - `space`: toggle clip selection
-- `d`/`enter`: download current clip (or selected clips)
-- `A`: download all clips
+- `d`/`enter`: queue current clip (or selected clips)
+- `A`: queue all clips
 - `p`: paste clip from clipboard
 - `D`: download only failed (selected clips)
 - `enter`/`space` on group header: expand/collapse
@@ -134,6 +135,7 @@ Clip list:
 Queue list:
 
 - `space`: toggle queue selection
+- `d`: start queued downloads
 - `p`: pause/resume selected queue items
 - `x`/`delete`: cancel selected queue items
 - `ctrl+up`/`ctrl+down`: move queue item

@@ -19,11 +19,8 @@ _TEMPLATE_FIELDS = {
     "end",
     "title",
     "label",
-    "rotation",
     "score",
     "opponent",
-    "serve_target",
-    "serve",
 }
 
 
@@ -113,10 +110,8 @@ def format_output_basename(
     validate_output_template(template)
     tag = clip.display_tag or clip.clip.tag or ""
     label = clip.clip.label or ""
-    rotation = clip.clip.rotation or ""
     score = clip.clip.score or ""
     opponent = clip.clip.opponent or ""
-    serve_target = clip.clip.serve_target or ""
     values = _SafeDict(
         tag=tag,
         videoid=clip.video_id,
@@ -124,11 +119,8 @@ def format_output_basename(
         end=format_seconds(clip.end_sec),
         title=title or "",
         label=label,
-        rotation=rotation,
         score=score,
         opponent=opponent,
-        serve_target=serve_target,
-        serve=serve_target,
     )
     raw = Formatter().vformat(template, (), values)
     if clip.clip.label and not _template_uses_field(template, "label"):

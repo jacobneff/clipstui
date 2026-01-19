@@ -15,10 +15,8 @@ MANIFEST_FIELDS = [
     "index",
     "tag",
     "label",
-    "rotation",
     "score",
     "opponent",
-    "serve_target",
     "video_id",
     "start_sec",
     "end_sec",
@@ -46,10 +44,8 @@ class ManifestEntry:
     index: int
     tag: str | None
     label: str | None
-    rotation: str | None
     score: str | None
     opponent: str | None
-    serve_target: str | None
     video_id: str
     start_sec: float
     end_sec: float
@@ -75,10 +71,8 @@ class ManifestEntry:
             "index": self.index,
             "tag": self.tag,
             "label": self.label,
-            "rotation": self.rotation,
             "score": self.score,
             "opponent": self.opponent,
-            "serve_target": self.serve_target,
             "video_id": self.video_id,
             "start_sec": self.start_sec,
             "end_sec": self.end_sec,
@@ -131,10 +125,8 @@ def build_manifest_entries(
                 index=index,
                 tag=tag,
                 label=clip.clip.label,
-                rotation=clip.clip.rotation,
                 score=clip.clip.score,
                 opponent=clip.clip.opponent,
-                serve_target=clip.clip.serve_target,
                 video_id=clip.video_id,
                 start_sec=start_sec,
                 end_sec=end_sec,
@@ -201,10 +193,8 @@ def _entry_csv_row(entry: ManifestEntry) -> dict[str, str]:
         "index": str(entry.index),
         "tag": entry.tag or "",
         "label": entry.label or "",
-        "rotation": entry.rotation or "",
         "score": entry.score or "",
         "opponent": entry.opponent or "",
-        "serve_target": entry.serve_target or "",
         "video_id": entry.video_id,
         "start_sec": format_seconds(entry.start_sec),
         "end_sec": format_seconds(entry.end_sec),

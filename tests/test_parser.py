@@ -93,7 +93,7 @@ def test_parse_pad_line() -> None:
 
 def test_parse_clip_header_fields() -> None:
     text = """
-    CLIP rally label=K rotation=1 score=22-20 opponent="Old Dominion" serve_target=Zone1
+    CLIP rally label=K score=22-20 opponent="Old Dominion"
     https://example.com/?t=10
     https://example.com/?t=20
     """
@@ -104,10 +104,8 @@ def test_parse_clip_header_fields() -> None:
             end_url="https://example.com/?t=20",
             tag="rally",
             label="K",
-            rotation="1",
             score="22-20",
             opponent="Old Dominion",
-            serve_target="Zone1",
         )
     ]
 
@@ -160,10 +158,8 @@ def test_format_clip_file_round_trip_fields() -> None:
         end_url="https://example.com/?t=4",
         tag="clip",
         label="A",
-        rotation="2",
         score="10-8",
         opponent="Old Dominion",
-        serve_target="Zone 1",
     )
     text = format_clip_file([clip])
     assert parse_clip_file(text) == [clip]

@@ -10,10 +10,8 @@ class ClipSpec:
     end_url: str
     tag: str | None = None
     label: str | None = None
-    rotation: str | None = None
     score: str | None = None
     opponent: str | None = None
-    serve_target: str | None = None
     pad_before: int | None = None
     pad_after: int | None = None
 
@@ -52,10 +50,8 @@ def parse_clip_file(text: str) -> list[ClipSpec]:
                 end_url=end_url,
                 tag=tag,
                 label=fields.get("label"),
-                rotation=fields.get("rotation"),
                 score=fields.get("score"),
                 opponent=fields.get("opponent"),
-                serve_target=fields.get("serve_target"),
                 pad_before=pad_before,
                 pad_after=pad_after,
             )
@@ -113,11 +109,8 @@ def format_clip_file(clips: list[ClipSpec]) -> str:
 
 _CLIP_FIELD_ALIASES = {
     "label": "label",
-    "rotation": "rotation",
     "score": "score",
     "opponent": "opponent",
-    "serve_target": "serve_target",
-    "serve": "serve_target",
 }
 
 
@@ -157,10 +150,8 @@ def _parse_clip_header(line: str, line_no: int) -> tuple[str | None, dict[str, s
 
 _CLIP_FIELD_ORDER = [
     ("label", "label"),
-    ("rotation", "rotation"),
     ("score", "score"),
     ("opponent", "opponent"),
-    ("serve_target", "serve_target"),
 ]
 
 

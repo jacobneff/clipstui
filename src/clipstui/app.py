@@ -108,6 +108,7 @@ from .ui.screens import (
     EndTimeScreen,
     PadInputScreen,
     MergeAdjacentScreen,
+    ThumbnailScreen,
 )
 from .ytdlp_runner import DownloadResult, ProgressUpdate, run_ytdlp_with_progress
 
@@ -115,9 +116,6 @@ DEFAULT_PAD_BEFORE = 1
 DEFAULT_PAD_AFTER = 1
 DEFAULT_MERGE_GAP = 1.0
 DEFAULT_OVERLAP_RATIO = 0.8
-SCRUB_STEP_SMALL = 0.1
-SCRUB_STEP_LARGE = 0.5
-SCRUB_THUMB_DEBOUNCE = 0.25
 TIP_TEXT = "Tip: press ? for help (and / to search)"
 CLIP_SORT_MODES = [
     ("default", "Default"),
@@ -183,15 +181,11 @@ Navigation
 arrow keys to move between clips
 
 Clip list
-d/enter  download current clip (or selected clips)
-space  toggle clip selection / group expand
+d/enter  queue current clip (or selected clips)
+space  toggle clip selection / group expand (adds to queue)
 +  toggle expand/collapse all groups
 p  paste clip from clipboard
 K/B/A/D/S/E  label selected clips (kill/block/ace/dig/set/error)
-[/]  scrub frame -/+0.1s
-{/}  scrub frame -/+0.5s
-,/.  scrub to start/end
-ctrl+r  refresh scrub frame
 e  edit clip
 a  add clip
 
@@ -201,6 +195,7 @@ Clip editor
 
 Queue list
 space  toggle queue selection
+d  start queued downloads
 p  pause/resume selected
 x  cancel selected
 ctrl+up/down  move queue item
@@ -463,6 +458,12 @@ class ClipstuiApp(App):
         border: round $accent;
     }
 
+    #left:focus-within,
+    #middle:focus-within,
+    #right:focus-within {
+        border: round $warning;
+    }
+
     #file_buffer, #clip_list {
         height: 1fr;
     }
@@ -552,21 +553,28 @@ class ClipstuiApp(App):
     }
 
     #thumb_box {
-        height: 14;
+        height: auto;
+        min-height: 10;
+        max-height: 20;
         width: 100%;
-        align: center top;
+        align: center middle;
+        border: round $secondary;
+        background: $panel;
+    }
+
+    #thumb_box:focus-within {
+        border: round $primary;
     }
 
     #thumb_image {
-        height: 14;
-        width: auto;
-        border: round $secondary;
+        height: auto;
+        width: 100%;
     }
 
     #thumb_fallback {
-        height: 14;
+        height: auto;
+        min-height: 10;
         width: 100%;
-        border: round $secondary;
         background: $panel;
         padding: 0 2;
         overflow: hidden;
@@ -590,6 +598,12 @@ class ClipstuiApp(App):
 
     #queue_list {
         height: 8;
+        border: round $boost;
+        background: $surface;
+    }
+
+    #queue_list:focus, #queue_list:focus-within {
+        border: round $primary;
     }
 
     #file_status, #clips_label, #queue_label {
@@ -725,9 +739,6 @@ class ClipstuiApp(App):
         self._clip_filter_text = ""
         self._clip_sort_mode = "default"
         self._clip_sort_reverse = False
-        self._scrub_times: dict[ResolvedClip, float] = {}
-        self._pending_scrub_clip: ResolvedClip | None = None
-        self._scrub_thumb_timer = None
         self._auto_tag_prefix_video = False
         self._pad_before_default = DEFAULT_PAD_BEFORE
         self._pad_after_default = DEFAULT_PAD_AFTER
@@ -767,6 +778,8 @@ class ClipstuiApp(App):
         self._thumb_errors: dict[tuple[str, str], str] = {}
         self._thumb_loading: set[tuple[str, str]] = set()
         self._thumb_fallback_cache: dict[tuple[str, str], Text] = {}
+        self._current_thumb_path: Path | None = None
+        self._current_thumb_message: str | None = "Thumbnail: --"
         self._direct_url_cache: dict[str, str] = {}
         self._video_thumb_cache: dict[str, Path] = {}
         self._video_thumb_errors: dict[str, str] = {}
@@ -830,8 +843,8 @@ class ClipstuiApp(App):
                     yield ListView(id="queue_list")
                 with Vertical(id="right"):
                     with Vertical(id="thumb_box"):
-                        yield PreviewImage(None, id="thumb_image")
-                        yield Static("Thumbnail: loading...", id="thumb_fallback", classes="hidden")
+                        yield PreviewImage(None, id="thumb_image", classes="hidden")
+                        yield Static("Thumbnail: --", id="thumb_fallback")
                     with VerticalScroll(id="preview_scroll"):
                         yield Static("Select a clip to preview.", id="preview_text")
             yield Static(TIP_TEXT, id="tip_bar")
@@ -859,9 +872,10 @@ class ClipstuiApp(App):
         if self._preview_scroll is not None:
             self._preview_scroll.can_focus = True
         if self._thumb_image is not None:
-            self._thumb_image.can_focus = False
+            self._thumb_image.can_focus = True
         if self._thumb_fallback is not None:
-            self._thumb_fallback.can_focus = False
+            self._thumb_fallback.can_focus = True
+            self._show_thumbnail_message("Thumbnail: --")
         self._set_file_mode(FileBufferMode.NORMAL)
         self.call_later(self._populate_file_buffer)
         self.set_interval(2.0, self._refresh_file_buffer_if_needed)
@@ -876,6 +890,13 @@ class ClipstuiApp(App):
         ):
             return
         self.push_screen(HelpScreen(HELP_TEXT))
+
+    def action_open_thumbnail(self) -> None:
+        path = self._current_thumb_path
+        message = self._current_thumb_message or "Thumbnail unavailable."
+        if path is not None and not path.exists():
+            path = None
+        self.push_screen(ThumbnailScreen(path, message))
 
     def action_output_dir(self) -> None:
         current = self._output_dir()
@@ -1166,6 +1187,16 @@ class ClipstuiApp(App):
             self._set_preview_message("No clips loaded.")
             return
         self._enqueue_clips(self._clips)
+
+    def action_start_queue(self) -> None:
+        queued_items = [
+            item for item in self._queue_items if item.status == DownloadStatus.QUEUED
+        ]
+        if not queued_items:
+            self._set_preview_message("No queued items to start.")
+            return
+        for item in queued_items:
+            self._start_queue_item(item)
 
     def action_add_clip(self) -> None:
         if self.clip_path is None:
@@ -1483,10 +1514,8 @@ class ClipstuiApp(App):
                 end_url=spec.end_url,
                 tag=spec.tag,
                 label=label,
-                rotation=spec.rotation,
                 score=spec.score,
                 opponent=spec.opponent,
-                serve_target=spec.serve_target,
                 pad_before=spec.pad_before,
                 pad_after=spec.pad_after,
             )
@@ -1556,10 +1585,8 @@ class ClipstuiApp(App):
                         end_url=second.end_url,
                         tag=first.tag or second.tag,
                         label=first.label or second.label,
-                        rotation=first.rotation or second.rotation,
                         score=first.score or second.score,
                         opponent=first.opponent or second.opponent,
-                        serve_target=first.serve_target or second.serve_target,
                         pad_before=first.pad_before,
                         pad_after=second.pad_after,
                     )
@@ -1594,11 +1621,6 @@ class ClipstuiApp(App):
         self._clip_selection.clear()
         self._selected = None
         self._selected_group_video_id = None
-        self._scrub_times.clear()
-        self._pending_scrub_clip = None
-        if self._scrub_thumb_timer is not None:
-            self._scrub_thumb_timer.stop()
-            self._scrub_thumb_timer = None
 
     def _write_clip_specs(self, specs: list[ClipSpec], *, select_index: int | None) -> None:
         if self.clip_path is None:
@@ -1645,12 +1667,24 @@ class ClipstuiApp(App):
             self._update_mode_status()
 
     def on_key(self, event: events.Key) -> None:
+        if (
+            (self._thumb_image is not None and self._thumb_image.has_focus)
+            or (self._thumb_fallback is not None and self._thumb_fallback.has_focus)
+        ):
+            if event.key in {"enter", "return"}:
+                self.action_open_thumbnail()
+                event.stop()
+                return
         if self._file_command is not None and self._file_command.has_focus:
             if event.key == "escape":
                 self._exit_command_mode()
             event.stop()
             return
         if self._file_buffer is not None and self._file_buffer.has_focus:
+            if event.character == "?" or event.key == "?":
+                self.action_help()
+                event.stop()
+                return
             if event.key == "tab":
                 if self._clip_list is not None:
                     self._clip_list.focus()
@@ -1763,12 +1797,6 @@ class ClipstuiApp(App):
         if self._clip_list is not None and self._clip_list.has_focus:
             current_item = self._current_clip_list_widget()
             key = event.character or event.key
-            if key in {"[", "]", "{", "}", ",", "."} or event.key == "ctrl+r":
-                if isinstance(current_item, ClipListItem):
-                    scrub_key = "ctrl+r" if event.key == "ctrl+r" else key
-                    if self._handle_scrub_key(current_item.resolved, scrub_key):
-                        event.stop()
-                        return
             label = LABEL_KEY_MAP.get(event.key)
             if key in {"+", "plus"}:
                 self._toggle_all_clip_groups()
@@ -1814,6 +1842,10 @@ class ClipstuiApp(App):
                 item = self._current_queue_list_item()
                 if item is not None:
                     self._toggle_queue_selection(item)
+                event.stop()
+                return
+            if event.key == "d":
+                self.action_start_queue()
                 event.stop()
                 return
             if event.key == "p":
@@ -2328,7 +2360,6 @@ class ClipstuiApp(App):
         self._selected = clip
         self._selected_group_video_id = None
         self._ensure_metadata(clip)
-        self._ensure_scrub_time(clip)
         queue_item = self._latest_queue_item_for_clip(clip)
         self._refresh_preview_text(clip, queue_item)
         self._refresh_thumbnail(clip)
@@ -2344,106 +2375,6 @@ class ClipstuiApp(App):
         title = _group_title(metadata)
         self._set_preview_message(_format_group_preview(group, title))
         self._show_group_thumbnail(group.video_id)
-
-    def _ensure_scrub_time(self, clip: ResolvedClip) -> None:
-        if clip in self._scrub_times:
-            return
-        self._scrub_times[clip] = self._clamp_scrub_time(clip, clip.start_sec)
-
-    def _clamp_scrub_time(self, clip: ResolvedClip, value: float) -> float:
-        lower = min(clip.cut_start, clip.cut_end)
-        upper = max(clip.cut_start, clip.cut_end)
-        return max(lower, min(upper, round(value, 3)))
-
-    def _set_scrub_time(
-        self,
-        clip: ResolvedClip,
-        value: float,
-        *,
-        force_refresh: bool = False,
-        defer_thumbnail: bool = False,
-    ) -> None:
-        new_value = self._clamp_scrub_time(clip, value)
-        previous = self._scrub_times.get(clip)
-        self._scrub_times[clip] = new_value
-        if self._selected is None or self._selected != clip:
-            self._set_preview(clip)
-            if force_refresh:
-                self._refresh_thumbnail(clip, force=True)
-            return
-        if previous is not None and abs(previous - new_value) <= 0.0005 and not force_refresh:
-            return
-        queue_item = self._latest_queue_item_for_clip(clip)
-        self._refresh_preview_text(clip, queue_item)
-        if force_refresh:
-            self._refresh_thumbnail(clip, force=True)
-            return
-        if defer_thumbnail:
-            key = _thumb_key_for_time(clip.video_id, new_value)
-            if self._thumb_cached_or_on_disk(key):
-                self._refresh_thumbnail(clip)
-            else:
-                self._schedule_scrub_thumbnail(clip)
-            return
-        self._refresh_thumbnail(clip)
-
-    def _adjust_scrub_time(self, clip: ResolvedClip, delta: float) -> None:
-        current = self._scrub_times.get(clip, clip.start_sec)
-        self._set_scrub_time(clip, current + delta, defer_thumbnail=True)
-
-    def _refresh_scrub_frame(self, clip: ResolvedClip) -> None:
-        self._ensure_scrub_time(clip)
-        if self._selected is None or self._selected != clip:
-            self._set_preview(clip)
-        self._refresh_thumbnail(clip, force=True)
-
-    def _schedule_scrub_thumbnail(self, clip: ResolvedClip) -> None:
-        self._pending_scrub_clip = clip
-        if self._scrub_thumb_timer is not None:
-            self._scrub_thumb_timer.stop()
-        self._scrub_thumb_timer = self.set_timer(
-            SCRUB_THUMB_DEBOUNCE, self._apply_scrub_thumbnail
-        )
-
-    def _apply_scrub_thumbnail(self) -> None:
-        self._scrub_thumb_timer = None
-        clip = self._pending_scrub_clip
-        self._pending_scrub_clip = None
-        if clip is None:
-            return
-        if self._selected is None or self._selected != clip:
-            return
-        self._refresh_thumbnail(clip)
-
-    def _thumb_cached_or_on_disk(self, key: tuple[str, str]) -> bool:
-        path = self._thumb_cache.get(key)
-        if path is not None and path.exists():
-            return True
-        path = self._thumb_path_for_key(key)
-        if path.exists():
-            self._thumb_cache[key] = path
-            return True
-        return False
-
-    def _handle_scrub_key(self, clip: ResolvedClip, key: str) -> bool:
-        if key == "ctrl+r":
-            self._refresh_scrub_frame(clip)
-            return True
-        if key in {"[", "]"}:
-            delta = SCRUB_STEP_SMALL if key == "]" else -SCRUB_STEP_SMALL
-            self._adjust_scrub_time(clip, delta)
-            return True
-        if key in {"{", "}"}:
-            delta = SCRUB_STEP_LARGE if key == "}" else -SCRUB_STEP_LARGE
-            self._adjust_scrub_time(clip, delta)
-            return True
-        if key == ",":
-            self._set_scrub_time(clip, clip.start_sec)
-            return True
-        if key == ".":
-            self._set_scrub_time(clip, clip.end_sec)
-            return True
-        return False
 
     def _schedule_preview(self, clip: ResolvedClip) -> None:
         self._pending_preview = clip
@@ -3478,7 +3409,7 @@ class ClipstuiApp(App):
         except ValueError:
             self._clip_list.index = children.index(items[0])
         self._sync_clip_list_highlight()
-        if schedule_preview:
+        if schedule_preview and self._selected is not target.resolved:
             self._schedule_preview(target.resolved)
 
     def _sync_clip_list_highlight(self) -> None:
@@ -3690,9 +3621,11 @@ class ClipstuiApp(App):
         if clip in self._clip_selection:
             self._clip_selection.remove(clip)
             item.set_selected(False)
-        else:
-            self._clip_selection.add(clip)
-            item.set_selected(True)
+            return
+        self._clip_selection.add(clip)
+        item.set_selected(True)
+        if self._latest_queue_item_for_clip(clip) is None:
+            self._enqueue_clip(clip)
 
     def _queue_list_items(self) -> list[QueueListItem]:
         if self._queue_list is None:
@@ -3903,7 +3836,7 @@ class ClipstuiApp(App):
         widget = QueueListItem(item, selected=False)
         self._queue_widgets[id(item)] = widget
         queue_list.append(widget)
-        self._start_queue_item(item)
+        self._refresh_preview_if_selected(item)
 
     def _jump_search_match(self, forward: bool) -> None:
         if not self._last_search_matches:
@@ -4112,9 +4045,9 @@ class ClipstuiApp(App):
             (
                 CommandAction(
                     "download_selected",
-                    "Download selected clips",
+                    "Queue selected clips",
                     "Queue selected or current clip",
-                    "download queue",
+                    "queue clips",
                     shortcut="d/enter (clips)",
                 ),
                 self.action_download,
@@ -4122,11 +4055,21 @@ class ClipstuiApp(App):
             (
                 CommandAction(
                     "download_all",
-                    "Download all clips",
+                    "Queue all clips",
                     "Queue every clip in file",
-                    "download queue",
+                    "queue clips",
                 ),
                 self.action_download_all,
+            ),
+            (
+                CommandAction(
+                    "start_queue",
+                    "Start queued downloads",
+                    "Start entire download queue",
+                    "start queue downloads",
+                    shortcut="d (queue)",
+                ),
+                self.action_start_queue,
             ),
             (
                 CommandAction(
@@ -4526,7 +4469,6 @@ class ClipstuiApp(App):
         merges = self._merge_index.get(clip, [])
         title = metadata.title if metadata and metadata.title else None
         output_name = item.output_name if item else self._output_basename_for_clip(clip, title)
-        scrub_time = self._scrub_times.get(clip, clip.start_sec)
         self._preview_text.update(
             _format_preview(
                 clip,
@@ -4537,7 +4479,6 @@ class ClipstuiApp(App):
                 metadata_error,
                 warnings,
                 merges,
-                scrub_time,
             )
         )
 
@@ -4668,6 +4609,8 @@ class ClipstuiApp(App):
                 self._video_thumb_errors[video_id] = message
                 self._show_thumbnail_message(f"Thumbnail error: {_short_error(message)}")
                 return
+            self._current_thumb_path = thumb_path
+            self._current_thumb_message = None
             self._thumb_image.remove_class("hidden")
             self._thumb_fallback.add_class("hidden")
             return
@@ -4684,8 +4627,7 @@ class ClipstuiApp(App):
     def _refresh_thumbnail(self, clip: ResolvedClip, *, force: bool = False) -> None:
         if self._thumb_image is None or self._thumb_fallback is None:
             return
-        scrub_time = self._scrub_times.get(clip, clip.start_sec)
-        key = _thumb_key_for_time(clip.video_id, scrub_time)
+        key = _thumb_key(clip)
         if force:
             self._invalidate_thumbnail_cache(key)
         thumb_error = self._thumb_errors.get(key)
@@ -4706,19 +4648,19 @@ class ClipstuiApp(App):
             return
         if key not in self._thumb_loading:
             self._show_thumbnail_message("Thumbnail: generating...")
-            self._ensure_thumbnail(clip, scrub_time)
+            self._ensure_thumbnail(clip)
         else:
             self._show_thumbnail_message("Thumbnail: generating...")
 
-    def _ensure_thumbnail(self, clip: ResolvedClip, scrub_time: float) -> None:
-        key = _thumb_key_for_time(clip.video_id, scrub_time)
+    def _ensure_thumbnail(self, clip: ResolvedClip) -> None:
+        key = _thumb_key(clip)
         if key in self._thumb_cache or key in self._thumb_loading:
             return
         self._thumb_loading.add(key)
         self._ensure_thumb_worker()
         if self._thumb_queue is None:
             return
-        self._thumb_queue.put((key, clip.clip.start_url, clip.video_id, scrub_time))
+        self._thumb_queue.put((key, clip.clip.start_url, clip.video_id, clip.start_sec))
 
     def _ensure_thumb_worker(self) -> None:
         if self._thumb_worker_started:
@@ -4731,14 +4673,14 @@ class ClipstuiApp(App):
         if self._thumb_queue is None:
             return
         while True:
-            key, url, video_id, scrub_time = self._thumb_queue.get()
+            key, url, video_id, start_sec = self._thumb_queue.get()
             direct_url = self._direct_url_cache.get(video_id)
             try:
                 if direct_url is None:
                     direct_url = get_direct_video_url(url)
                     self._direct_url_cache[video_id] = direct_url
                 path = generate_clip_thumbnail(
-                    url, video_id, scrub_time, direct_url=direct_url
+                    url, video_id, start_sec, direct_url=direct_url
                 )
                 self.call_from_thread(self._apply_thumbnail, key, path, None)
             except Exception as exc:
@@ -4748,7 +4690,7 @@ class ClipstuiApp(App):
                         direct_url = get_direct_video_url(url)
                         self._direct_url_cache[video_id] = direct_url
                         path = generate_clip_thumbnail(
-                            url, video_id, scrub_time, direct_url=direct_url
+                            url, video_id, start_sec, direct_url=direct_url
                         )
                         self.call_from_thread(self._apply_thumbnail, key, path, None)
                     except Exception as retry_exc:
@@ -4769,8 +4711,7 @@ class ClipstuiApp(App):
         if error:
             self._thumb_errors[key] = error
         if self._selected is not None:
-            scrub_time = self._scrub_times.get(self._selected, self._selected.start_sec)
-            if _thumb_key_for_time(self._selected.video_id, scrub_time) == key:
+            if _thumb_key(self._selected) == key:
                 self._refresh_thumbnail(self._selected)
 
     def _thumb_path_for_key(self, key: tuple[str, str]) -> Path:
@@ -4820,6 +4761,8 @@ class ClipstuiApp(App):
     def _show_thumbnail_message(self, message: str) -> None:
         if self._thumb_fallback is None or self._thumb_image is None:
             return
+        self._current_thumb_path = None
+        self._current_thumb_message = message
         self._thumb_fallback.update(message)
         self._thumb_fallback.remove_class("hidden")
         self._thumb_image.add_class("hidden")
@@ -4832,6 +4775,8 @@ class ClipstuiApp(App):
         except Exception as exc:
             self._thumb_errors[key] = str(exc)
             return False
+        self._current_thumb_path = path
+        self._current_thumb_message = None
         self._thumb_image.remove_class("hidden")
         self._thumb_fallback.add_class("hidden")
         return True
@@ -4848,6 +4793,8 @@ class ClipstuiApp(App):
             if cached is None:
                 return False
             self._thumb_fallback_cache[key] = cached
+        self._current_thumb_path = path
+        self._current_thumb_message = None
         self._thumb_fallback.update(cached)
         self._thumb_fallback.remove_class("hidden")
         self._thumb_image.add_class("hidden")
@@ -4985,14 +4932,11 @@ def _format_preview(
     metadata_error: str | None,
     warnings: list[OverlapFinding] | None,
     merges: list[MergeSuggestion] | None,
-    scrub_time: float,
 ) -> str:
     tag = _format_tag_label(clip)
     label_value = _format_preview_value(clip.clip.label)
-    rotation = _format_preview_value(clip.clip.rotation)
     score = _format_preview_value(clip.clip.score)
     opponent = _format_preview_value(clip.clip.opponent)
-    serve_target = _format_preview_value(clip.clip.serve_target)
     output_format = item.output_format if item else default_format
     output_name = _format_output_name(output_name, output_format)
     title = metadata.title if metadata and metadata.title else "--"
@@ -5011,15 +4955,12 @@ def _format_preview(
             "",
             f"Tag: {tag}",
             f"Label: {label_value}",
-            f"Rotation: {rotation}",
             f"Score: {score}",
             f"Opponent: {opponent}",
-            f"Serve Target: {serve_target}",
             f"Video ID: {clip.video_id}",
             f"Start: {format_seconds(clip.start_sec)}",
             f"End: {format_seconds(clip.end_sec)}",
             f"Cut: {format_seconds(clip.cut_start)}-{format_seconds(clip.cut_end)}",
-            f"Scrub: {_format_scrub_line(clip, scrub_time)}",
             f"Output: {output_name}",
         ]
     )
@@ -5062,10 +5003,8 @@ def _clip_has_context(clip: ResolvedClip) -> bool:
     return any(
         [
             clip.clip.label,
-            clip.clip.rotation,
             clip.clip.score,
             clip.clip.opponent,
-            clip.clip.serve_target,
         ]
     )
 
@@ -5079,10 +5018,8 @@ def _build_clip_sidecar_payload(
     return {
         "tag": tag,
         "label": clip.clip.label,
-        "rotation": clip.clip.rotation,
         "score": clip.clip.score,
         "opponent": clip.clip.opponent,
-        "serve_target": clip.clip.serve_target,
         "video_id": clip.video_id,
         "start_sec": clip.start_sec,
         "end_sec": clip.end_sec,
@@ -5107,18 +5044,6 @@ def _sidecar_path(output_path: Path) -> Path:
 
 def _format_preview_value(value: str | None) -> str:
     return value if value else "--"
-
-
-def _format_scrub_line(clip: ResolvedClip, scrub_time: float) -> str:
-    label = "scrub"
-    if abs(scrub_time - clip.start_sec) <= 0.001:
-        label = "start"
-    elif abs(scrub_time - clip.end_sec) <= 0.001:
-        label = "end"
-    return (
-        f"{label} {format_seconds(scrub_time)} "
-        f"(range {format_seconds(clip.cut_start)}-{format_seconds(clip.cut_end)})"
-    )
 
 
 def _format_duration(duration: int | None) -> str | None:
@@ -5243,11 +5168,8 @@ def _clip_matches_filter(
         "label": (clip.clip.label or "").lower(),
         "video": clip.video_id.lower(),
         "title": (title or "").lower(),
-        "rotation": (clip.clip.rotation or "").lower(),
         "score": (clip.clip.score or "").lower(),
         "opponent": (clip.clip.opponent or "").lower(),
-        "serve": (clip.clip.serve_target or "").lower(),
-        "serve_target": (clip.clip.serve_target or "").lower(),
     }
     haystack = " ".join(fields.values())
     for key, value in tokens:
@@ -5265,12 +5187,8 @@ def _clip_matches_filter(
     return True
 
 
-def _thumb_key_for_time(video_id: str, seconds: float) -> tuple[str, str]:
-    return (video_id, format_seconds(seconds))
-
-
 def _thumb_key(clip: ResolvedClip) -> tuple[str, str]:
-    return _thumb_key_for_time(clip.video_id, clip.start_sec)
+    return (clip.video_id, format_seconds(clip.start_sec))
 
 
 def _index_overlaps(findings: list[OverlapFinding]) -> dict[ResolvedClip, list[OverlapFinding]]:
@@ -5306,10 +5224,8 @@ def _apply_pad_updates(
             end_url=spec.end_url,
             tag=spec.tag,
             label=spec.label,
-            rotation=spec.rotation,
             score=spec.score,
             opponent=spec.opponent,
-            serve_target=spec.serve_target,
             pad_before=new_before,
             pad_after=new_after,
         )
@@ -5330,10 +5246,8 @@ def _normalize_pad_overrides(
                 end_url=spec.end_url,
                 tag=spec.tag,
                 label=spec.label,
-                rotation=spec.rotation,
                 score=spec.score,
                 opponent=spec.opponent,
-                serve_target=spec.serve_target,
                 pad_before=None,
                 pad_after=None,
             )
